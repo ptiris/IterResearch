@@ -26,7 +26,10 @@ from config import (
     MAX_FORMAT_RETRIES,
     MAX_WORKERS,
     MAX_OBSERVATION_TOKENS,
-    TOKENIZER_PATH
+    MAX_WEBPAGE_TOKENS,
+    TOKENIZER_PATH,
+    SUMMARY_LLM_URL,
+    SUMMARY_LLM_AUTH
 )
 from prompts import (
     initial_instruction_prompt,
@@ -34,7 +37,8 @@ from prompts import (
     observation_prompt,
     last_instruction_prompt
 )
-from tools import Search, Scholar, PythonInterpreter, Visit
+from tools import Search, BaiduSearch, Scholar, PythonInterpreter, Visit
+from config import SUMMARY_LLM_AUTH, OPENAI_API_KEY
 
 
 # =============================================================================
@@ -44,6 +48,22 @@ TOOLS = [
     {
         "name": "google_search",
         "description": "Perform Google web searches then returns a string of the top search results. Accepts multiple queries.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "array",
+                    "items": {"type": "string", "description": "The search query."},
+                    "minItems": 1,
+                    "description": "The list of search queries."
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "baidu_search",
+        "description": "Perform Baidu web searches via Qianfan API then returns a string of the top search results. Accepts multiple queries.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -124,9 +144,19 @@ tool_list = [t['name'] for t in TOOLS]
 
 # Initialize tools
 python_executor = PythonInterpreter()
-search_engine = Search()
+google_search_engine = Search()
+baidu_search_engine = BaiduSearch()
+search_engine = google_search_engine
 scholar_engine = Scholar()
 visit_tool = Visit()
+
+SEARCH_ENGINE = "google"
+RESEARCH_MODEL = "qwen-flash"
+SUMMARY_LLM_URL_CONFIG = SUMMARY_LLM_URL
+SUMMARY_MODEL = "qwen-flash"
+TOKENIZER_PATH_CONFIG = TOKENIZER_PATH
+MAX_OBSERVATION_TOKENS_CONFIG = MAX_OBSERVATION_TOKENS
+MAX_WEBPAGE_TOKENS_CONFIG = MAX_WEBPAGE_TOKENS
 
 # Statistics
 failed_call = 0
@@ -141,7 +171,7 @@ def get_tokenizer():
     if _tokenizer is None:
         try:
             from transformers import AutoTokenizer
-            _tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
+            _tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH_CONFIG)
         except Exception as e:
             print(f"Warning: Could not load tokenizer: {e}")
     return _tokenizer
@@ -216,7 +246,8 @@ def call_llm(
     messages: list,
     check_format: bool = False,
     max_retries: int = MAX_FORMAT_RETRIES,
-    llm_url: str = LLM_URL
+    llm_url: str = LLM_URL,
+    model: str = None
 ) -> EasyDict:
     """
     Call the LLM with the given messages.
@@ -226,19 +257,25 @@ def call_llm(
         check_format: Whether to validate response format.
         max_retries: Maximum retries for format validation.
         llm_url: URL of the LLM endpoint.
+        model: Model name to use. Falls back to RESEARCH_MODEL global.
         
     Returns:
         LLM response as EasyDict.
     """
-    global total_call, failed_call
+    global total_call, failed_call, RESEARCH_MODEL
     
     headers = {'Content-Type': 'application/json'}
+    if OPENAI_API_KEY:
+        headers['Authorization'] = f'Bearer {OPENAI_API_KEY}'
+    
     response = None
+    
+    model_name = model or RESEARCH_MODEL
     
     for attempt in range(max_retries):
         try:
             payload = {
-                "model": "",
+                "model": model_name,
                 "messages": messages,
                 "temperature": 0.6,
                 "top_p": 0.95,
@@ -288,12 +325,15 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
     """
     try:
         if tool_name == 'google_search':
-            return search_engine.call(arguments), []
+            return google_search_engine.call(arguments), []
+        
+        elif tool_name == 'baidu_search':
+            return baidu_search_engine.call(arguments), []
         
         elif tool_name == 'google_scholar':
             query = arguments.get('query', [])
             scholar_result = scholar_engine.call({"query": query})
-            search_result = search_engine.call(arguments)
+            search_result = google_search_engine.call(arguments)
             return f"{scholar_result}\n\n{search_result}", []
         
         elif tool_name == 'PythonInterpreter':
@@ -344,12 +384,12 @@ def format_context(
     tokenizer = get_tokenizer()
     if tokenizer and len(observation) > 32000:
         tokens = tokenizer.encode(observation)
-        if len(tokens) > MAX_OBSERVATION_TOKENS:
+        if len(tokens) > MAX_OBSERVATION_TOKENS_CONFIG:
             observation = tokenizer.decode(
-                tokens[:MAX_OBSERVATION_TOKENS],
+                tokens[:MAX_OBSERVATION_TOKENS_CONFIG],
                 skip_special_tokens=True
             )
-            print(f'Observation truncated to {MAX_OBSERVATION_TOKENS} tokens')
+            print(f'Observation truncated to {MAX_OBSERVATION_TOKENS_CONFIG} tokens')
     
     if is_last:
         return last_instruction_prompt.replace("{question}", question)\
@@ -374,7 +414,8 @@ def agentic_loop(
     data: dict,
     max_format_retries: int = MAX_FORMAT_RETRIES,
     max_turn: int = MAX_TURN,
-    llm_url: str = LLM_URL
+    llm_url: str = LLM_URL,
+    model: str = None
 ) -> tuple:
     """
     Run the agent loop for a single question.
@@ -384,6 +425,7 @@ def agentic_loop(
         max_format_retries: Max retries for format validation.
         max_turn: Maximum number of turns.
         llm_url: LLM endpoint URL.
+        model: Model name to use for research.
         
     Returns:
         Tuple of (result_dict, full_result_dict).
@@ -415,7 +457,8 @@ def agentic_loop(
             messages,
             check_format=True,
             max_retries=max_format_retries,
-            llm_url=llm_url
+            llm_url=llm_url,
+            model=model
         )
         
         if not response:
@@ -505,6 +548,34 @@ def agentic_loop(
 # =============================================================================
 def main(args):
     """Main entry point."""
+    global SEARCH_ENGINE, RESEARCH_MODEL, SUMMARY_LLM_URL_CONFIG, SUMMARY_MODEL
+    global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
+    global visit_tool
+    
+    SEARCH_ENGINE = args.search_engine
+    RESEARCH_MODEL = args.research_model
+    SUMMARY_LLM_URL_CONFIG = args.summary_llm_url
+    SUMMARY_MODEL = args.summary_model
+    TOKENIZER_PATH_CONFIG = args.tokenizer_path
+    MAX_OBSERVATION_TOKENS_CONFIG = args.max_observation_tokens
+    MAX_WEBPAGE_TOKENS_CONFIG = args.max_webpage_tokens
+    
+    visit_tool = Visit(
+        summary_llm_url=args.summary_llm_url,
+        summary_llm_auth=SUMMARY_LLM_AUTH,
+        summary_model=args.summary_model,
+        max_webpage_tokens=args.max_webpage_tokens,
+        tokenizer_path=args.tokenizer_path
+    )
+    
+    print(f"Using search engine: {SEARCH_ENGINE}")
+    print(f"Using research model: {RESEARCH_MODEL}")
+    print(f"Using summary LLM URL: {SUMMARY_LLM_URL_CONFIG}")
+    print(f"Using summary model: {SUMMARY_MODEL}")
+    print(f"Using tokenizer path: {TOKENIZER_PATH_CONFIG}")
+    print(f"Max observation tokens: {MAX_OBSERVATION_TOKENS_CONFIG}")
+    print(f"Max webpage tokens: {MAX_WEBPAGE_TOKENS_CONFIG}")
+    
     # Load input data
     all_data = []
     with open(args.input_fp, 'r', encoding='utf-8') as f:
@@ -537,7 +608,8 @@ def main(args):
                 data=data,
                 max_format_retries=args.max_format_retries,
                 max_turn=args.max_turn,
-                llm_url=args.llm_url
+                llm_url=args.llm_url,
+                model=args.research_model
             )
             for data in all_data
         ]
@@ -608,6 +680,50 @@ if __name__ == "__main__":
         type=str,
         default=LLM_URL,
         help="URL of the LLM endpoint"
+    )
+    parser.add_argument(
+        "--research_model",
+        type=str,
+        default="qwen-flash",
+        help="Name of the research model to use (e.g., qwen-flash, qwen-plus)"
+    )
+    parser.add_argument(
+        "--summary_model",
+        type=str,
+        default="qwen-flash",
+        help="Name of the model to use for summarization"
+    )
+    parser.add_argument(
+        "--search_engine",
+        type=str,
+        default="google",
+        choices=["google", "baidu"],
+        help="Search engine to use: 'google' for Google SerpAPI, 'baidu' for Baidu Qianfan"
+    )
+    parser.add_argument(
+        "--summary_llm_url",
+        type=str,
+        default=SUMMARY_LLM_URL,
+
+        help="URL of the summary LLM endpoint"
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=TOKENIZER_PATH,
+        help="Path to tokenizer model for token counting"
+    )
+    parser.add_argument(
+        "--max_observation_tokens",
+        type=int,
+        default=MAX_OBSERVATION_TOKENS,
+        help="Maximum tokens for observation content"
+    )
+    parser.add_argument(
+        "--max_webpage_tokens",
+        type=int,
+        default=MAX_WEBPAGE_TOKENS,
+        help="Maximum tokens for webpage content"
     )
     
     args = parser.parse_args()

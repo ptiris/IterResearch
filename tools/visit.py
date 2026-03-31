@@ -56,11 +56,12 @@ EXTRACTOR_PROMPT = """Please process the following webpage content and user goal
 """
 
 
-def _load_tokenizer():
+def _load_tokenizer(tokenizer_path: str = None):
     """Load tokenizer for token counting."""
     try:
         from transformers import AutoTokenizer
-        return AutoTokenizer.from_pretrained(TOKENIZER_PATH)
+        path = tokenizer_path or TOKENIZER_PATH
+        return AutoTokenizer.from_pretrained(path)
     except Exception as e:
         print(f"Warning: Could not load tokenizer: {e}")
         return None
@@ -137,7 +138,9 @@ class Visit:
         scraper_api_key: Optional[str] = None,
         summary_llm_url: Optional[str] = None,
         summary_llm_auth: Optional[str] = None,
-        max_webpage_tokens: int = None
+        summary_model: Optional[str] = None,
+        max_webpage_tokens: int = None,
+        tokenizer_path: Optional[str] = None
     ):
         """
         Initialize the Visit tool.
@@ -147,14 +150,17 @@ class Visit:
             scraper_api_key: API key for ScraperAPI.
             summary_llm_url: URL for the summary LLM.
             summary_llm_auth: Authorization header for summary LLM.
+            summary_model: Model name for the summary LLM.
             max_webpage_tokens: Maximum tokens for webpage content.
+            tokenizer_path: Path to tokenizer model for token counting.
         """
         self.jina_api_key = jina_api_key or JINA_API_KEY
         self.scraper_api_key = scraper_api_key or SCRAPER_API_KEY
         self.summary_llm_url = summary_llm_url or SUMMARY_LLM_URL
         self.summary_llm_auth = summary_llm_auth or SUMMARY_LLM_AUTH
+        self.summary_model = summary_model or "qwen-flash"
         self.max_webpage_tokens = max_webpage_tokens or MAX_WEBPAGE_TOKENS
-        self.tokenizer = _load_tokenizer()
+        self.tokenizer = _load_tokenizer(tokenizer_path or TOKENIZER_PATH)
 
     def call(self, params: Union[str, dict], **kwargs) -> Tuple[str, list]:
         """
@@ -391,7 +397,7 @@ class Visit:
             headers['Authorization'] = self.summary_llm_auth
         
         payload = {
-            "model": "",
+            "model": self.summary_model,
             "messages": messages,
             "temperature": 0.7,
             "top_p": 0.8,

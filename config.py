@@ -5,11 +5,15 @@ All configurations can be overridden by environment variables.
 """
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # =============================================================================
 # LLM Configuration
 # =============================================================================
 # Main LLM endpoint for agent reasoning
 LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # Summary LLM endpoint for webpage content extraction
 SUMMARY_LLM_URL = os.getenv("SUMMARY_LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
@@ -25,6 +29,10 @@ SEARCH_API_URL = os.getenv("SEARCH_API_URL", "https://serpapi.com/search")
 # Google Scholar API
 SCHOLAR_API_KEY = os.getenv("SCHOLAR_API_KEY", "")
 SCHOLAR_API_URL = os.getenv("SCHOLAR_API_URL", "https://serpapi.com/search")
+
+# Baidu Qianfan Search API
+BAIDU_API_KEY = os.getenv("BAIDU_API_KEY", "")
+BAIDU_API_URL = os.getenv("BAIDU_URL", "https://qianfan.baidubce.com/v2/ai_search/web_search")
 
 # =============================================================================
 # Webpage Reading Configuration

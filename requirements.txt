@@ -4,6 +4,7 @@
 requests>=2.28.0
 tqdm>=4.64.0
 easydict>=1.9
+python-dotenv>=1.0.0
 
 # Tokenizer (for context length management)
 transformers>=4.30.0
