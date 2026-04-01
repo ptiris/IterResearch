@@ -39,108 +39,136 @@ from prompts import (
 )
 from tools import Search, BaiduSearch, Scholar, PythonInterpreter, Visit
 from config import SUMMARY_LLM_AUTH, OPENAI_API_KEY
+from metrics import get_metrics_collector, StepRecord
 
 
 # =============================================================================
 # Tool Definitions
 # =============================================================================
-TOOLS = [
-    {
-        "name": "google_search",
-        "description": "Perform Google web searches then returns a string of the top search results. Accepts multiple queries.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "array",
-                    "items": {"type": "string", "description": "The search query."},
-                    "minItems": 1,
-                    "description": "The list of search queries."
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "baidu_search",
-        "description": "Perform Baidu web searches via Qianfan API then returns a string of the top search results. Accepts multiple queries.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "array",
-                    "items": {"type": "string", "description": "The search query."},
-                    "minItems": 1,
-                    "description": "The list of search queries."
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "google_scholar",
-        "description": "Leverage Google Scholar to retrieve relevant information from academic publications. Accepts multiple queries. This tool will also return results from google search",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "array",
-                    "items": {"type": "string", "description": "The search query."},
-                    "minItems": 1,
-                    "description": "The list of search queries for Google Scholar."
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "Visit",
-        "description": "Visit webpage(s) or paper(s) and return the summary of the content.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "description": "The URL(s) of the webpage(s) or paper(s) to visit."
-                },
-                "goal": {
-                    "type": "string",
-                    "description": "The goal of the visit for webpage(s) or paper(s)."
-                },
-                "parse_type": {
-                    "type": "string",
-                    "enum": ["html", "pdf"],
-                    "default": "html",
-                    "description": "Specify whether to visit a HTML webpage or a PDF paper."
-                }
-            },
-            "required": ["url", "goal"]
-        }
-    },
-    {
-        "name": "PythonInterpreter",
-        "description": "Executes arbitrary Python code in a secure, sandboxed environment. This tool is designed for performing complex calculations, data manipulations, string processing, logical operations, and general programming tasks. Use print() for any output you want to see.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "The Python code to execute. All output should be explicitly printed using print() functions."
-                }
-            },
-            "required": ["code"]
-        }
+GOOGLE_SEARCH_TOOL = {
+    "name": "google_search",
+    "description": "Perform Google web searches then returns a string of the top search results. Accepts multiple queries.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "array",
+                "items": {"type": "string", "description": "The search query."},
+                "minItems": 1,
+                "description": "The list of search queries."
+            }
+        },
+        "required": ["query"]
     }
+}
+
+BAIDU_SEARCH_TOOL = {
+    "name": "baidu_search",
+    "description": "Perform Baidu web searches via Qianfan API then returns a string of the top search results. Accepts multiple queries.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "array",
+                "items": {"type": "string", "description": "The search query."},
+                "minItems": 1,
+                "description": "The list of search queries."
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+GOOGLE_SCHOLAR_TOOL = {
+    "name": "google_scholar",
+    "description": "Leverage Google Scholar to retrieve relevant information from academic publications. Accepts multiple queries. This tool will also return results from google search",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "array",
+                "items": {"type": "string", "description": "The search query."},
+                "minItems": 1,
+                "description": "The list of search queries for Google Scholar."
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+VISIT_TOOL = {
+    "name": "Visit",
+    "description": "Visit webpage(s) or paper(s) and return the summary of the content.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "The URL(s) of the webpage(s) or paper(s) to visit."
+            },
+            "goal": {
+                "type": "string",
+                "description": "The goal of the visit for webpage(s) or paper(s)."
+            },
+            "parse_type": {
+                "type": "string",
+                "enum": ["html", "pdf"],
+                "default": "html",
+                "description": "Specify whether to visit a HTML webpage or a PDF paper."
+            }
+        },
+        "required": ["url", "goal"]
+    }
+}
+
+PYTHON_INTERPRETER_TOOL = {
+    "name": "PythonInterpreter",
+    "description": "Executes arbitrary Python code in a secure, sandboxed environment. This tool is designed for performing complex calculations, data manipulations, string processing, logical operations, and general programming tasks. Use print() for any output you want to see.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "The Python code to execute. All output should be explicitly printed using print() functions."
+            }
+        },
+        "required": ["code"]
+    }
+}
+
+TOOLS = [
+    GOOGLE_SEARCH_TOOL,
+    BAIDU_SEARCH_TOOL,
+    GOOGLE_SCHOLAR_TOOL,
+    VISIT_TOOL,
+    PYTHON_INTERPRETER_TOOL
 ]
 
 
 # =============================================================================
 # Global Variables
 # =============================================================================
-tool_str = json.dumps(TOOLS, indent=2)
-tool_list = [t['name'] for t in TOOLS]
+
+
+def get_tools_for_engine(search_engine: str) -> list:
+    """Get filtered TOOLS list based on selected search engine."""
+    base_tools = [VISIT_TOOL, PYTHON_INTERPRETER_TOOL]
+    
+    if search_engine == "google":
+        return base_tools + [GOOGLE_SEARCH_TOOL, GOOGLE_SCHOLAR_TOOL]
+    elif search_engine == "baidu":
+        return base_tools + [BAIDU_SEARCH_TOOL]
+    
+    return base_tools + [GOOGLE_SEARCH_TOOL, BAIDU_SEARCH_TOOL, GOOGLE_SCHOLAR_TOOL]
+
+
+def get_tool_str_for_engine(search_engine: str) -> str:
+    """Get filtered TOOLS JSON string based on selected search engine."""
+    filtered_tools = get_tools_for_engine(search_engine)
+    return json.dumps(filtered_tools, indent=2)
+
 
 # Initialize tools
 python_executor = PythonInterpreter()
@@ -157,6 +185,7 @@ SUMMARY_MODEL = "qwen-flash"
 TOKENIZER_PATH_CONFIG = TOKENIZER_PATH
 MAX_OBSERVATION_TOKENS_CONFIG = MAX_OBSERVATION_TOKENS
 MAX_WEBPAGE_TOKENS_CONFIG = MAX_WEBPAGE_TOKENS
+DISABLE_GOOGLE_SCHOLAR = False
 
 # Statistics
 failed_call = 0
@@ -218,7 +247,7 @@ def check_report_action(response) -> tuple:
     report = extract_tags(text, 'report')
     action = extract_tags(text, 'tool_call')
     answer = extract_tags(text, 'answer')
-    
+    print(f"Tool call extracted: {action}")
     if action:
         try:
             tool_call = json.loads(action)
@@ -247,7 +276,8 @@ def call_llm(
     check_format: bool = False,
     max_retries: int = MAX_FORMAT_RETRIES,
     llm_url: str = LLM_URL,
-    model: str = None
+    model: str = None,
+    turn: int = -1
 ) -> EasyDict:
     """
     Call the LLM with the given messages.
@@ -258,6 +288,7 @@ def call_llm(
         max_retries: Maximum retries for format validation.
         llm_url: URL of the LLM endpoint.
         model: Model name to use. Falls back to RESEARCH_MODEL global.
+        turn: Current iteration turn number for metrics tracking.
         
     Returns:
         LLM response as EasyDict.
@@ -269,6 +300,7 @@ def call_llm(
         headers['Authorization'] = f'Bearer {OPENAI_API_KEY}'
     
     response = None
+    call_start_time = time.time()
     
     model_name = model or RESEARCH_MODEL
     
@@ -282,7 +314,9 @@ def call_llm(
                 "presence_penalty": 1.5
             }
             
+            llm_call_start = time.time()
             resp = requests.post(llm_url, headers=headers, json=payload, timeout=300)
+            llm_call_latency_ms = (time.time() - llm_call_start) * 1000
             
             if resp.status_code != 200:
                 print(f"LLM Error: {resp.text}")
@@ -298,7 +332,21 @@ def call_llm(
                 if not is_valid:
                     failed_call += 1
                     print(f"Format check failed: {reason}")
+                    print(f"Response: {response}")
                     raise Exception(reason)
+            
+            metrics = get_metrics_collector()
+            prompt_tokens = response.usage.get('prompt_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
+            completion_tokens = response.usage.get('completion_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
+            total_latency_ms = (time.time() - call_start_time) * 1000
+            
+            metrics.record_llm_call(
+                model=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=llm_call_latency_ms,
+                turn=turn
+            )
             
             return response
             
@@ -323,32 +371,67 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
     Returns:
         Tuple of (result_string, summary_messages_list).
     """
+    tool_start_time = time.time()
+    metrics = get_metrics_collector()
+    tool_success = False
+    
     try:
         if tool_name == 'google_search':
-            return google_search_engine.call(arguments), []
+            result = google_search_engine.call(arguments)
+            tool_success = True
+            return result, []
         
         elif tool_name == 'baidu_search':
-            return baidu_search_engine.call(arguments), []
+            result = baidu_search_engine.call(arguments)
+            tool_success = True
+            return result, []
         
         elif tool_name == 'google_scholar':
             query = arguments.get('query', [])
-            scholar_result = scholar_engine.call({"query": query})
-            search_result = google_search_engine.call(arguments)
-            return f"{scholar_result}\n\n{search_result}", []
+            if DISABLE_GOOGLE_SCHOLAR:
+                result = search_engine.call(arguments)
+            else:
+                scholar_result = scholar_engine.call({"query": query})
+                search_result = google_search_engine.call(arguments)
+                result = f"{scholar_result}\n\n{search_result}"
+            tool_success = True
+            return result, []
         
         elif tool_name == 'PythonInterpreter':
-            code = arguments.get('code', '')
-            return python_executor.call({"code": code}), []
+            result = python_executor.call({"code": arguments.get('code', '')})
+            tool_success = True
+            return result, []
         
         elif tool_name == 'Visit':
             result, summary_messages = visit_tool.call(arguments)
+            tool_success = True
             return result, summary_messages
         
         else:
+            tool_success = True
             return f"Unknown tool: {tool_name}", []
             
     except Exception as e:
+        tool_latency_ms = (time.time() - tool_start_time) * 1000
+        metrics.record_tool_call(
+            tool_name=tool_name,
+            args=arguments,
+            latency_ms=tool_latency_ms,
+            success=False,
+            error=type(e).__name__
+        )
+        print(f"[{tool_name}] Failure: {str(e)}")
         return f"Tool execution error: {str(e)}", []
+    
+    finally:
+        tool_latency_ms = (time.time() - tool_start_time) * 1000
+        if tool_success:
+            metrics.record_tool_call(
+                tool_name=tool_name,
+                args=arguments,
+                latency_ms=tool_latency_ms,
+                success=True
+            )
 
 
 # =============================================================================
@@ -358,7 +441,8 @@ def format_context(
     messages: list,
     question: str,
     date: str,
-    is_last: bool = False
+    is_last: bool = False,
+    search_engine: str = "google"
 ) -> str:
     """
     Format the context for the next turn.
@@ -368,6 +452,7 @@ def format_context(
         question: The original question.
         date: Current date string.
         is_last: Whether this is the last turn.
+        search_engine: The search engine to use ("google" or "baidu").
         
     Returns:
         Formatted prompt string.
@@ -390,6 +475,8 @@ def format_context(
                 skip_special_tokens=True
             )
             print(f'Observation truncated to {MAX_OBSERVATION_TOKENS_CONFIG} tokens')
+    
+    tool_str = get_tool_str_for_engine(search_engine)
     
     if is_last:
         return last_instruction_prompt.replace("{question}", question)\
@@ -437,13 +524,18 @@ def agentic_loop(
     is_last_turn = False
     conversations = []
     
+    metrics = get_metrics_collector()
+    metrics.start_question(task)
+    
     # Initial message
+    tool_str_for_engine = get_tool_str_for_engine(SEARCH_ENGINE)
     messages = [{
         "role": "user",
         "content": initial_instruction_prompt.replace('{question}', task)\
-            .replace("{tools}", tool_str)\
+            .replace("{tools}", tool_str_for_engine)\
             .replace('{date_to_use}', date)
     }]
+    print(messages[0]['content'])
     
     records = copy.deepcopy(messages)
     summary_records = []
@@ -452,17 +544,22 @@ def agentic_loop(
     for turn in range(max_turn):
         print(f"Turn {turn + 1}/{max_turn}")
         
+        turn_start_time = time.time()
+        metrics.start_iteration(turn=turn, query=task, action="llm_call")
+        
         # Get LLM response
         response = call_llm(
             messages,
             check_format=True,
             max_retries=max_format_retries,
             llm_url=llm_url,
-            model=model
+            model=model,
+            turn=turn
         )
         
         if not response:
             print("Failed to get valid response")
+            metrics.end_iteration()
             break
         
         cur_message = dict(response.choices[0].message)
@@ -487,6 +584,8 @@ def agentic_loop(
         
         # If no tool call, agent has finished
         if not tool_call:
+            metrics.update_iteration_action(action="final_answer")
+            metrics.end_iteration()
             conversations.append(messages)
             break
         
@@ -494,9 +593,20 @@ def agentic_loop(
         tool_name = tool_call.get('name', 'unknown')
         tool_args = tool_call.get('arguments', {})
         
+        metrics.update_iteration_action(
+            action=f"tool_call:{tool_name}",
+            tool_name=tool_name,
+            tool_args=tool_args
+        )
+        
         print(f"Calling tool: {tool_name}")
         observation, summary_messages = execute_tool(tool_name, tool_args)
         summary_records.extend(summary_messages)
+        
+        metrics.update_iteration_tool_result(
+            result=observation,
+            result_length=len(observation) if observation else 0
+        )
         
         # Create tool message
         tool_message = {
@@ -508,6 +618,8 @@ def agentic_loop(
         messages.append(tool_message)
         records.append(tool_message)
         
+        metrics.end_iteration()
+        
         # Check if this is the second-to-last turn
         if turn == max_turn - 2:
             is_last_turn = True
@@ -516,19 +628,23 @@ def agentic_loop(
         
         # Format context for next turn
         try:
-            cur_turn = format_context(messages, task, date, is_last=is_last_turn)
+            cur_turn = format_context(messages, task, date, is_last=is_last_turn, search_engine=SEARCH_ENGINE)
         except Exception as e:
             print(f"Context formatting error: {e}")
             break
         
         messages = [{"role": "user", "content": cur_turn}]
     
+    # End question and get metrics
+    question_metrics = metrics.end_question(final_answer_found=not tool_call)
+    
     result = {
         'question': task,
         'answer': answer,
         'records': records,
         'usage': usage,
-        'conversations': conversations
+        'conversations': conversations,
+        'metrics': question_metrics
     }
     
     full_result = {
@@ -537,7 +653,8 @@ def agentic_loop(
         'records': records,
         'summary_records': summary_records,
         'usage': usage,
-        'conversations': conversations
+        'conversations': conversations,
+        'metrics': question_metrics
     }
     
     return result, full_result
@@ -550,9 +667,10 @@ def main(args):
     """Main entry point."""
     global SEARCH_ENGINE, RESEARCH_MODEL, SUMMARY_LLM_URL_CONFIG, SUMMARY_MODEL
     global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
-    global visit_tool
+    global visit_tool, DISABLE_GOOGLE_SCHOLAR
     
     SEARCH_ENGINE = args.search_engine
+    DISABLE_GOOGLE_SCHOLAR = args.disable_google_scholar
     RESEARCH_MODEL = args.research_model
     SUMMARY_LLM_URL_CONFIG = args.summary_llm_url
     SUMMARY_MODEL = args.summary_model
@@ -575,6 +693,7 @@ def main(args):
     print(f"Using tokenizer path: {TOKENIZER_PATH_CONFIG}")
     print(f"Max observation tokens: {MAX_OBSERVATION_TOKENS_CONFIG}")
     print(f"Max webpage tokens: {MAX_WEBPAGE_TOKENS_CONFIG}")
+    print(f"Google Scholar: {'disabled' if DISABLE_GOOGLE_SCHOLAR else 'enabled'}")
     
     # Load input data
     all_data = []
@@ -600,6 +719,9 @@ def main(args):
     
     # Process questions
     all_results = []
+    
+    metrics = get_metrics_collector()
+    metrics.start_global_timer()
     
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [
@@ -630,10 +752,42 @@ def main(args):
                 traceback.print_exc()
                 print(f"Error processing question: {e}")
     
+    metrics.end_global_timer()
+    
     print(f"\nResults saved to: {output_file}")
     print(f"Full results saved to: {full_output_file}")
     print(f"Total: {len(all_results)} questions processed")
     print(f"LLM call success rate: {((total_call - failed_call) / total_call * 100):.2f}%" if total_call > 0 else "N/A")
+    
+    summary = metrics.get_summary()
+    if summary:
+        print("\n" + "=" * 60)
+        print("METRICS SUMMARY")
+        print("=" * 60)
+        print(f"Total Questions: {summary.get('total_questions', 0)}")
+        print(f"Total Turns: {summary.get('total_turns', 0)}")
+        print(f"Avg Turns/Question: {summary.get('avg_turns_per_question', 0)}")
+        print(f"Answer Success Rate: {summary.get('answer_success_rate', 'N/A')}")
+        print(f"\nLLM Statistics:")
+        llm_stats = summary.get('llm', {})
+        print(f"  Total LLM Calls: {llm_stats.get('total_calls', 0)}")
+        print(f"  Total Prompt Tokens: {llm_stats.get('total_prompt_tokens', 0)}")
+        print(f"  Total Completion Tokens: {llm_stats.get('total_completion_tokens', 0)}")
+        print(f"  Total LLM Latency: {llm_stats.get('total_latency_ms', 0):.2f}ms")
+        print(f"  By Model:")
+        for model, model_stats in llm_stats.get('by_model', {}).items():
+            print(f"    {model}: {model_stats['calls']} calls, {model_stats['prompt_tokens']} prompt + {model_stats['completion_tokens']} completion tokens")
+        print(f"\nIteration Distribution:")
+        iter_dist = summary.get('iteration_distribution', {})
+        print(f"  Min: {iter_dist.get('min', 0)}, Max: {iter_dist.get('max', 0)}, Avg: {iter_dist.get('avg', 0)}")
+        print(f"\nTool Statistics:")
+        for tool_name, tool_stats in summary.get('tools', {}).items():
+            print(f"  {tool_name}:")
+            print(f"    Calls: {tool_stats.get('calls', 0)}, Success: {tool_stats.get('success_rate', 'N/A')}")
+            print(f"    Avg Latency: {tool_stats.get('avg_latency_ms', 0):.2f}ms, Total: {tool_stats.get('total_latency_ms', 0):.2f}ms")
+            if tool_stats.get('total_input_tokens', 0) > 0 or tool_stats.get('total_output_tokens', 0) > 0:
+                print(f"    Tokens: {tool_stats.get('total_input_tokens', 0)} input + {tool_stats.get('total_output_tokens', 0)} output")
+        print(f"\nGlobal Time: {summary.get('global_time_ms', 0):.2f}ms")
 
 
 if __name__ == "__main__":
@@ -724,6 +878,11 @@ if __name__ == "__main__":
         type=int,
         default=MAX_WEBPAGE_TOKENS,
         help="Maximum tokens for webpage content"
+    )
+    parser.add_argument(
+        "--disable_google_scholar",
+        action="store_true",
+        help="Disable Google Scholar tool, fallback to regular search"
     )
     
     args = parser.parse_args()

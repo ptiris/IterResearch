@@ -27,7 +27,7 @@ except ImportError:
     import os
     JINA_API_KEY = os.getenv("JINA_API_KEY", "")
     SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
-    SUMMARY_LLM_URL = os.getenv("SUMMARY_LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
+    SUMMARY_LLM_URL = os.getenv("SUMMARY_LLM_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
     SUMMARY_LLM_AUTH = os.getenv("SUMMARY_LLM_AUTH", "")
     MAX_WEBPAGE_TOKENS = int(os.getenv("MAX_WEBPAGE_TOKENS", "48000"))
     TOKENIZER_PATH = os.getenv("TOKENIZER_PATH", "Qwen/Qwen2.5-7B-Instruct")
@@ -161,6 +161,39 @@ class Visit:
         self.summary_model = summary_model or "qwen-flash"
         self.max_webpage_tokens = max_webpage_tokens or MAX_WEBPAGE_TOKENS
         self.tokenizer = _load_tokenizer(tokenizer_path or TOKENIZER_PATH)
+        
+        # Stats tracking
+        self.total_calls = 0
+        self.successful_calls = 0
+        self.failed_calls = 0
+        self.total_fetch_time_ms = 0.0
+        self.total_summary_llm_time_ms = 0.0
+        self.total_summary_input_tokens = 0
+        self.total_summary_output_tokens = 0
+    
+    def get_stats(self) -> dict:
+        """Get visit tool statistics."""
+        return {
+            "total_calls": self.total_calls,
+            "successful_calls": self.successful_calls,
+            "failed_calls": self.failed_calls,
+            "success_rate": f"{(self.successful_calls / self.total_calls * 100):.2f}%" if self.total_calls > 0 else "0%",
+            "total_fetch_time_ms": round(self.total_fetch_time_ms, 2),
+            "avg_fetch_time_ms": round(self.total_fetch_time_ms / self.total_calls, 2) if self.total_calls > 0 else 0,
+            "total_summary_llm_time_ms": round(self.total_summary_llm_time_ms, 2),
+            "total_summary_input_tokens": self.total_summary_input_tokens,
+            "total_summary_output_tokens": self.total_summary_output_tokens,
+        }
+    
+    def reset_stats(self):
+        """Reset statistics."""
+        self.total_calls = 0
+        self.successful_calls = 0
+        self.failed_calls = 0
+        self.total_fetch_time_ms = 0.0
+        self.total_summary_llm_time_ms = 0.0
+        self.total_summary_input_tokens = 0
+        self.total_summary_output_tokens = 0
 
     def call(self, params: Union[str, dict], **kwargs) -> Tuple[str, list]:
         """
@@ -228,8 +261,10 @@ class Visit:
             Tuple of (extracted information, summary message dict).
         """
         max_attempts = 3
+        self.total_calls += 1
         
         for attempt in range(max_attempts):
+            fetch_start = time.time()
             try:
                 # Get content based on type detection
                 content_type, content = self._fetch_content(url)
@@ -238,6 +273,8 @@ class Visit:
                     content = parse_pdf(content, use_cloud=False)
                 elif not content or content.startswith("[visit]"):
                     content = self._jina_fetch(url)
+                
+                self.total_fetch_time_ms += (time.time() - fetch_start) * 1000
                 
                 if not content or content.startswith("[visit]"):
                     continue
@@ -257,12 +294,17 @@ class Visit:
                     goal=goal
                 )}]
                 
-                raw_response = self._call_summary_llm(messages)
+                raw_response, input_tokens, output_tokens, llm_time_ms = self._call_summary_llm(messages)
+                
+                self.total_summary_input_tokens += input_tokens
+                self.total_summary_output_tokens += output_tokens
+                self.total_summary_llm_time_ms += llm_time_ms
                 
                 if not raw_response:
                     useful_info = f"The useful information in '{url}' for user goal '{goal}':\n\n"
                     useful_info += "Evidence: The webpage content could not be processed.\n"
                     useful_info += "Summary: No information available.\n"
+                    self.successful_calls += 1
                     return useful_info, None
                 
                 # Parse the response
@@ -279,12 +321,16 @@ class Visit:
                 summary_message = copy.deepcopy(messages)
                 summary_message.append({"role": "assistant", "content": raw_response})
                 
+                self.successful_calls += 1
                 return useful_info, summary_message
                 
             except Exception as e:
+                self.total_fetch_time_ms += (time.time() - fetch_start) * 1000
                 if attempt == max_attempts - 1:
+                    self.failed_calls += 1
                     return f"[visit] Failed to read page (url: {url}, goal: {goal}): {str(e)}", None
         
+        self.failed_calls += 1
         return f"[visit] Failed to read page (url: {url}, goal: {goal})", None
 
     def _fetch_content(self, url: str) -> Tuple[str, str]:
@@ -379,7 +425,7 @@ class Visit:
         
         return "[visit] Failed to read page."
 
-    def _call_summary_llm(self, messages: list) -> Optional[str]:
+    def _call_summary_llm(self, messages: list) -> Tuple[Optional[str], int, int, float]:
         """
         Call the summary LLM to extract information.
         
@@ -387,11 +433,12 @@ class Visit:
             messages: Chat messages for the LLM.
             
         Returns:
-            LLM response text or None.
+            Tuple of (LLM response text or None, input tokens, output tokens, latency_ms).
         """
         if not self.summary_llm_url:
-            return None
-        
+            return None, 0, 0, 0.0
+        print("=== Calling summary LLM ===")
+        print(self.summary_llm_url)
         headers = {'Content-Type': 'application/json'}
         if self.summary_llm_auth:
             headers['Authorization'] = self.summary_llm_auth
@@ -404,6 +451,8 @@ class Visit:
             "max_tokens": 24000,
         }
         
+        start_time = time.time()
+        
         for attempt in range(5):
             try:
                 response = requests.post(
@@ -414,13 +463,23 @@ class Visit:
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data['choices'][0]['message']['content']
+                
+                latency_ms = (time.time() - start_time) * 1000
+                input_tokens = 0
+                output_tokens = 0
+                
+                if 'usage' in data:
+                    input_tokens = data['usage'].get('prompt_tokens', 0)
+                    output_tokens = data['usage'].get('completion_tokens', 0)
+                
+                return data['choices'][0]['message']['content'], input_tokens, output_tokens, latency_ms
             except Exception as e:
                 if attempt == 4:
                     print(f"Summary LLM call failed: {e}")
                 time.sleep(2)
         
-        return None
+        latency_ms = (time.time() - start_time) * 1000
+        return None, 0, 0, latency_ms
 
 
 if __name__ == "__main__":

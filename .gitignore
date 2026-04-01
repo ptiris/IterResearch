@@ -116,3 +116,6 @@ pdf/
 # Model cache
 *.bin
 *.safetensors
+
+# Expiriments 
+data/

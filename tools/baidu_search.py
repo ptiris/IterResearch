@@ -53,19 +53,26 @@ class BaiduSearch:
         
         self.total_requests = 0
         self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
     
     def get_stats(self) -> dict:
         """Get search statistics."""
         return {
             "total_requests": self.total_requests,
             "successful_requests": self.successful_requests,
-            "success_rate": f"{(self.successful_requests / self.total_requests * 100):.2f}%" if self.total_requests > 0 else "0%"
+            "failed_requests": self.failed_requests,
+            "success_rate": f"{(self.successful_requests / self.total_requests * 100):.2f}%" if self.total_requests > 0 else "0%",
+            "avg_latency_ms": round(self.total_latency_ms / self.total_requests, 2) if self.total_requests > 0 else 0,
+            "total_latency_ms": round(self.total_latency_ms, 2)
         }
     
     def reset_stats(self):
         """Reset statistics."""
         self.total_requests = 0
         self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
     
     def _contains_chinese(self, text: str) -> bool:
         """Check if text contains Chinese characters."""
@@ -81,6 +88,7 @@ class BaiduSearch:
         Returns:
             Formatted search results as a string.
         """
+        start_time = time.time()
         self.total_requests += 1
         
         headers = {
@@ -113,6 +121,7 @@ class BaiduSearch:
                 if len(raw_results) == 0:
                     empty_result_retries += 1
                     if empty_result_retries >= max_empty_retries:
+                        self.total_latency_ms += (time.time() - start_time) * 1000
                         return f"No results found for '{query}'. Try with a more general query."
                     time.sleep(1)
                     continue
@@ -129,14 +138,18 @@ class BaiduSearch:
                     web_snippets.append(formatted)
                 
                 self.successful_requests += 1
+                self.total_latency_ms += (time.time() - start_time) * 1000
                 content = f"A Baidu search for '{query}' found {len(web_snippets)} results:\n\n## Web Results\n" + "\n\n".join(web_snippets)
                 return content
                 
             except Exception as e:
                 if attempt == max_retries - 1:
+                    self.total_latency_ms += (time.time() - start_time) * 1000
+                    self.failed_requests += 1
                     return f"Search failed for '{query}': {str(e)}"
                 time.sleep(2)
         
+        self.total_latency_ms += (time.time() - start_time) * 1000
         return f"No results found for '{query}'. Try with a more general query."
     
     def call(self, params: Union[str, dict], **kwargs) -> str:

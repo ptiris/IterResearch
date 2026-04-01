@@ -31,7 +31,7 @@ SCHOLAR_API_KEY = os.getenv("SCHOLAR_API_KEY", "")
 SCHOLAR_API_URL = os.getenv("SCHOLAR_API_URL", "https://serpapi.com/search")
 
 # Baidu Qianfan Search API
-BAIDU_API_KEY = os.getenv("BAIDU_API_KEY", "")
+BAIDU_API_KEY = os.getenv("BAIDU_API", os.getenv("BAIDU_API_KEY", ""))
 BAIDU_API_URL = os.getenv("BAIDU_URL", "https://qianfan.baidubce.com/v2/ai_search/web_search")
 
 # =============================================================================

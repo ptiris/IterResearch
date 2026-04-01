@@ -51,6 +51,33 @@ class PythonInterpreter:
         """
         self.endpoints = endpoints or SANDBOX_ENDPOINTS
         self.default_timeout = timeout
+        
+        # Stats tracking
+        self.total_calls = 0
+        self.successful_calls = 0
+        self.failed_calls = 0
+        self.timeout_calls = 0
+        self.total_latency_ms = 0.0
+    
+    def get_stats(self) -> dict:
+        """Get Python interpreter statistics."""
+        return {
+            "total_calls": self.total_calls,
+            "successful_calls": self.successful_calls,
+            "failed_calls": self.failed_calls,
+            "timeout_calls": self.timeout_calls,
+            "success_rate": f"{(self.successful_calls / self.total_calls * 100):.2f}%" if self.total_calls > 0 else "0%",
+            "avg_latency_ms": round(self.total_latency_ms / self.total_calls, 2) if self.total_calls > 0 else 0,
+            "total_latency_ms": round(self.total_latency_ms, 2)
+        }
+    
+    def reset_stats(self):
+        """Reset statistics."""
+        self.total_calls = 0
+        self.successful_calls = 0
+        self.failed_calls = 0
+        self.timeout_calls = 0
+        self.total_latency_ms = 0.0
 
     def _extract_code(self, code: str) -> str:
         """
@@ -133,6 +160,9 @@ class PythonInterpreter:
             Execution output or error message.
         """
         timeout = timeout or self.default_timeout
+        start_time = time.time()
+        
+        self.total_calls += 1
         
         # Parse parameters
         if isinstance(params, str):
@@ -146,9 +176,11 @@ class PythonInterpreter:
         code = self._extract_code(code)
         
         if not code.strip():
+            self.failed_calls += 1
             return "[Python Interpreter Error]: Empty code."
         
         if not self.endpoints:
+            self.failed_calls += 1
             return "[Python Interpreter Error]: No sandbox endpoints configured. Please set SANDBOX_ENDPOINTS in environment."
         
         # Try endpoints with retry
@@ -161,11 +193,19 @@ class PythonInterpreter:
             success, result, exec_time = self._execute_on_endpoint(code, endpoint, timeout)
             
             if success:
+                latency_ms = (time.time() - start_time) * 1000
+                self.total_latency_ms += latency_ms
+                self.successful_calls += 1
                 return result
             
             last_error = result
+            if "TimeoutError" in result:
+                self.timeout_calls += 1
             time.sleep(1)
         
+        latency_ms = (time.time() - start_time) * 1000
+        self.total_latency_ms += latency_ms
+        self.failed_calls += 1
         return last_error if last_error else "[Python Interpreter Error]: All attempts failed."
 
 

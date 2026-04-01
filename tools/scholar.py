@@ -52,6 +52,30 @@ class Scholar:
         """
         self.api_key = api_key or SCHOLAR_API_KEY
         self.api_url = api_url or SCHOLAR_API_URL
+        
+        # Stats tracking
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
+    
+    def get_stats(self) -> dict:
+        """Get scholar statistics."""
+        return {
+            "total_requests": self.total_requests,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
+            "success_rate": f"{(self.successful_requests / self.total_requests * 100):.2f}%" if self.total_requests > 0 else "0%",
+            "avg_latency_ms": round(self.total_latency_ms / self.total_requests, 2) if self.total_requests > 0 else 0,
+            "total_latency_ms": round(self.total_latency_ms, 2)
+        }
+    
+    def reset_stats(self):
+        """Reset statistics."""
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
 
     def _search_single(self, query: str) -> str:
         """
@@ -63,6 +87,9 @@ class Scholar:
         Returns:
             Formatted search results as a string.
         """
+        start_time = time.time()
+        self.total_requests += 1
+        
         params = {
             "api_key": self.api_key,
             "engine": "google_scholar",
@@ -82,6 +109,7 @@ class Scholar:
                 organic_results = results.get("organic_results", [])
                 
                 if not organic_results:
+                    self.total_latency_ms += (time.time() - start_time) * 1000
                     return f"No results found for query: '{query}'. Use a less specific query."
                 
                 # Format results
@@ -116,13 +144,18 @@ class Scholar:
                     web_snippets.append(formatted)
                 
                 content = f"A Google Scholar search for '{query}' found {len(web_snippets)} results:\n\n## Scholar Results\n" + "\n\n".join(web_snippets)
+                self.total_latency_ms += (time.time() - start_time) * 1000
+                self.successful_requests += 1
                 return content
                 
             except Exception as e:
                 if attempt == max_retries - 1:
+                    self.total_latency_ms += (time.time() - start_time) * 1000
+                    self.failed_requests += 1
                     return f"Google Scholar search failed for '{query}': {str(e)}"
                 time.sleep(1)
         
+        self.total_latency_ms += (time.time() - start_time) * 1000
         return f"No results found for '{query}'. Try with a more general query."
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
