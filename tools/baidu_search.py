@@ -97,8 +97,13 @@ class BaiduSearch:
         }
         
         payload = {
-            "query": query,
-            "num_results": 10
+            "messages": [
+                {
+                    "role": "user",
+                    "content": query
+                }
+            ],
+            "resource_type_filter": [{"type": "web", "top_k": 10}]
         }
         
         max_retries = 5
@@ -116,9 +121,9 @@ class BaiduSearch:
                 response.raise_for_status()
                 results = response.json()
                 
-                raw_results = results.get("results", [])
+                references = results.get("references", [])
                 
-                if len(raw_results) == 0:
+                if len(references) == 0:
                     empty_result_retries += 1
                     if empty_result_retries >= max_empty_retries:
                         self.total_latency_ms += (time.time() - start_time) * 1000
@@ -127,14 +132,26 @@ class BaiduSearch:
                     continue
                 
                 web_snippets = []
-                for idx, page in enumerate(raw_results, 1):
-                    title = page.get("title", "No title")
-                    url = page.get("url", "")
-                    abstract = page.get("abstract", "")
+                for idx, ref in enumerate(references, 1):
+                    title = ref.get("title", "No title")
+                    url = ref.get("url", "")
+                    snippet = ref.get("snippet", "")
+                    date = ref.get("date", "")
+                    website = ref.get("website", "")
                     
-                    abstract_str = f"\nAbstract: {abstract}" if abstract else ""
+                    snippet_parts = []
+                    if date:
+                        snippet_parts.append(f"Date: {date}")
+                    if website:
+                        snippet_parts.append(f"Source: {website}")
+                    if snippet:
+                        snippet_parts.append(snippet)
                     
-                    formatted = f"{idx}. [{title}]({url}){abstract_str}"
+                    snippet_str = " - ".join(snippet_parts) if snippet_parts else ""
+                    formatted = f"{idx}. [{title}]({url})"
+                    if snippet_str:
+                        formatted += f"\n   {snippet_str}"
+                    
                     web_snippets.append(formatted)
                 
                 self.successful_requests += 1

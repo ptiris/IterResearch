@@ -34,6 +34,10 @@ SCHOLAR_API_URL = os.getenv("SCHOLAR_API_URL", "https://serpapi.com/search")
 BAIDU_API_KEY = os.getenv("BAIDU_API", os.getenv("BAIDU_API_KEY", ""))
 BAIDU_API_URL = os.getenv("BAIDU_URL", "https://qianfan.baidubce.com/v2/ai_search/web_search")
 
+# Aliyun IQS API
+IQS_API_KEY = os.getenv("IQS_API_KEY", "")
+IQS_BASE_URL = os.getenv("IQS_BASE_URL", "https://cloud-iqs.aliyuncs.com")
+
 # =============================================================================
 # Webpage Reading Configuration
 # =============================================================================

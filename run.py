@@ -37,7 +37,7 @@ from prompts import (
     observation_prompt,
     last_instruction_prompt
 )
-from tools import Search, BaiduSearch, Scholar, PythonInterpreter, Visit
+from tools import Search, BaiduSearch, AliyunIQSSearch, Scholar, PythonInterpreter, Visit
 from config import SUMMARY_LLM_AUTH, OPENAI_API_KEY
 from metrics import get_metrics_collector, StepRecord
 
@@ -65,6 +65,23 @@ GOOGLE_SEARCH_TOOL = {
 BAIDU_SEARCH_TOOL = {
     "name": "baidu_search",
     "description": "Perform Baidu web searches via Qianfan API then returns a string of the top search results. Accepts multiple queries.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "array",
+                "items": {"type": "string", "description": "The search query."},
+                "minItems": 1,
+                "description": "The list of search queries."
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+ALIYUN_IQS_TOOL = {
+    "name": "aliyun_iqs_search",
+    "description": "Aliyun Information Query Service search, providing real-time open-domain search capabilities. Accepts multiple queries.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -160,8 +177,10 @@ def get_tools_for_engine(search_engine: str) -> list:
         return base_tools + [GOOGLE_SEARCH_TOOL, GOOGLE_SCHOLAR_TOOL]
     elif search_engine == "baidu":
         return base_tools + [BAIDU_SEARCH_TOOL]
+    elif search_engine == "aliyun":
+        return base_tools + [ALIYUN_IQS_TOOL]
     
-    return base_tools + [GOOGLE_SEARCH_TOOL, BAIDU_SEARCH_TOOL, GOOGLE_SCHOLAR_TOOL]
+    return base_tools + [GOOGLE_SEARCH_TOOL, BAIDU_SEARCH_TOOL, GOOGLE_SCHOLAR_TOOL, ALIYUN_IQS_TOOL]
 
 
 def get_tool_str_for_engine(search_engine: str) -> str:
@@ -174,6 +193,7 @@ def get_tool_str_for_engine(search_engine: str) -> str:
 python_executor = PythonInterpreter()
 google_search_engine = Search()
 baidu_search_engine = BaiduSearch()
+aliyun_iqs_engine = AliyunIQSSearch()
 search_engine = google_search_engine
 scholar_engine = Scholar()
 visit_tool = Visit()
@@ -319,7 +339,16 @@ def call_llm(
             llm_call_latency_ms = (time.time() - llm_call_start) * 1000
             
             if resp.status_code != 200:
-                print(f"LLM Error: {resp.text}")
+                print(f"LLM Error: {resp.status_code}: {resp.text}")
+                metrics = get_metrics_collector()
+                metrics.record_llm_call(
+                    model=model_name,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    latency_ms=llm_call_latency_ms,
+                    turn=turn,
+                    success=False
+                )
                 continue
             
             response = EasyDict(resp.json())
@@ -327,26 +356,30 @@ def call_llm(
             
             total_call += 1
             
+            metrics = get_metrics_collector()
+            prompt_tokens = response.usage.get('prompt_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
+            completion_tokens = response.usage.get('completion_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
+            
+            llm_success = True
             if check_format:
                 is_valid, reason = check_report_action(response)
                 if not is_valid:
                     failed_call += 1
+                    llm_success = False
                     print(f"Format check failed: {reason}")
                     print(f"Response: {response}")
-                    raise Exception(reason)
-            
-            metrics = get_metrics_collector()
-            prompt_tokens = response.usage.get('prompt_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
-            completion_tokens = response.usage.get('completion_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
-            total_latency_ms = (time.time() - call_start_time) * 1000
             
             metrics.record_llm_call(
                 model=model_name,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 latency_ms=llm_call_latency_ms,
-                turn=turn
+                turn=turn,
+                success=llm_success
             )
+            
+            if not llm_success:
+                raise Exception("Format check failed")
             
             return response
             
@@ -360,6 +393,47 @@ def call_llm(
 # =============================================================================
 # Tool Execution
 # =============================================================================
+def _print_search_error(tool_name: str, error_type: str, error_msg: str):
+    """Print prominent error message for search failures."""
+    print(f"\n{'='*60}")
+    print(f"🔴 [{tool_name.upper()}] SEARCH FAILED")
+    print(f"{'='*60}")
+    print(f"Error Type: {error_type}")
+    print(f"Details: {error_msg}")
+    print(f"{'='*60}\n")
+
+
+def _is_search_failure(result: str) -> bool:
+    """Check if search result indicates a failure."""
+    if not isinstance(result, str):
+        return False
+    failure_indicators = [
+        "Search failed",
+        "No results found",
+        "Error:",
+        "API_KEY",
+        "Invalid request",
+        "[Search] Error",
+        "[BaiduSearch] Error",
+        "[AliyunIQS] Error",
+        "[Google Scholar] Error",
+        "Google Scholar search failed",
+        "TimeoutError"
+    ]
+    return any(result.startswith(indicator) or indicator in result for indicator in failure_indicators)
+
+
+def _is_tool_failure(result: str, tool_name: str = None) -> bool:
+    """Check if tool result indicates a failure."""
+    if not isinstance(result, str):
+        return False
+    if tool_name == 'PythonInterpreter':
+        return result.startswith("[Python Interpreter Error]") or "TimeoutError" in result
+    if tool_name == 'Visit':
+        return result.startswith("[visit] Failed")
+    return _is_search_failure(result)
+
+
 def execute_tool(tool_name: str, arguments: dict) -> tuple:
     """
     Execute a tool with the given arguments.
@@ -373,17 +447,69 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
     """
     tool_start_time = time.time()
     metrics = get_metrics_collector()
-    tool_success = False
     
     try:
         if tool_name == 'google_search':
             result = google_search_engine.call(arguments)
-            tool_success = True
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_search_failure(result):
+                _print_search_error(tool_name, "Search Error", result)
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="SearchFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
             return result, []
         
         elif tool_name == 'baidu_search':
             result = baidu_search_engine.call(arguments)
-            tool_success = True
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_search_failure(result):
+                _print_search_error(tool_name, "Search Error", result)
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="SearchFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
+            return result, []
+        
+        elif tool_name == 'aliyun_iqs_search':
+            result = aliyun_iqs_engine.call(arguments)
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_search_failure(result):
+                _print_search_error(tool_name, "Search Error", result)
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="SearchFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
             return result, []
         
         elif tool_name == 'google_scholar':
@@ -394,44 +520,102 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                 scholar_result = scholar_engine.call({"query": query})
                 search_result = google_search_engine.call(arguments)
                 result = f"{scholar_result}\n\n{search_result}"
-            tool_success = True
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_search_failure(result):
+                _print_search_error(tool_name, "Search Error", result)
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="SearchFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
             return result, []
         
         elif tool_name == 'PythonInterpreter':
             result = python_executor.call({"code": arguments.get('code', '')})
-            tool_success = True
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_tool_failure(result, tool_name):
+                print(f"\n{'='*60}")
+                print(f"🔴 [{tool_name.upper()}] EXECUTION FAILED")
+                print(f"{'='*60}")
+                print(f"Details: {result}")
+                print(f"{'='*60}\n")
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="ExecutionFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
             return result, []
         
         elif tool_name == 'Visit':
             result, summary_messages = visit_tool.call(arguments)
-            tool_success = True
+            latency_ms = (time.time() - tool_start_time) * 1000
+            if _is_tool_failure(result, tool_name):
+                print(f"\n{'='*60}")
+                print(f"🔴 [{tool_name.upper()}] VISIT FAILED")
+                print(f"{'='*60}")
+                print(f"Details: {result}")
+                print(f"{'='*60}\n")
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="VisitFailed"
+                )
+            else:
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=True
+                )
             return result, summary_messages
         
         else:
-            tool_success = True
-            return f"Unknown tool: {tool_name}", []
+            result = f"Unknown tool: {tool_name}"
+            metrics.record_tool_call(
+                tool_name=tool_name,
+                args=arguments,
+                latency_ms=(time.time() - tool_start_time) * 1000,
+                success=True
+            )
+            return result, []
             
     except Exception as e:
+        error_type = type(e).__name__
+        error_msg = str(e)
         tool_latency_ms = (time.time() - tool_start_time) * 1000
+        
+        if tool_name in ('google_search', 'baidu_search', 'aliyun_iqs_search', 'google_scholar'):
+            _print_search_error(tool_name, error_type, error_msg)
+        
         metrics.record_tool_call(
             tool_name=tool_name,
             args=arguments,
             latency_ms=tool_latency_ms,
             success=False,
-            error=type(e).__name__
+            error=error_type
         )
-        print(f"[{tool_name}] Failure: {str(e)}")
-        return f"Tool execution error: {str(e)}", []
-    
-    finally:
-        tool_latency_ms = (time.time() - tool_start_time) * 1000
-        if tool_success:
-            metrics.record_tool_call(
-                tool_name=tool_name,
-                args=arguments,
-                latency_ms=tool_latency_ms,
-                success=True
-            )
+        print(f"[{tool_name}] Failure: {error_msg}")
+        return f"Tool execution error: {error_msg}", []
 
 
 # =============================================================================
@@ -788,6 +972,16 @@ def main(args):
             if tool_stats.get('total_input_tokens', 0) > 0 or tool_stats.get('total_output_tokens', 0) > 0:
                 print(f"    Tokens: {tool_stats.get('total_input_tokens', 0)} input + {tool_stats.get('total_output_tokens', 0)} output")
         print(f"\nGlobal Time: {summary.get('global_time_ms', 0):.2f}ms")
+        
+        if args.save_metrics:
+            try:
+                metrics_file = args.save_metrics
+                os.makedirs(os.path.dirname(metrics_file) or '.', exist_ok=True)
+                with open(metrics_file, 'w', encoding='utf-8') as f:
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
+                print(f"\nMetrics saved to: {metrics_file}")
+            except Exception as e:
+                print(f"\nFailed to save metrics: {e}")
 
 
 if __name__ == "__main__":
@@ -850,8 +1044,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--search_engine",
         type=str,
-        default="google",
-        choices=["google", "baidu"],
+        default=None,
+        choices=["google", "baidu","aliyun"],
         help="Search engine to use: 'google' for Google SerpAPI, 'baidu' for Baidu Qianfan"
     )
     parser.add_argument(
@@ -883,6 +1077,12 @@ if __name__ == "__main__":
         "--disable_google_scholar",
         action="store_true",
         help="Disable Google Scholar tool, fallback to regular search"
+    )
+    parser.add_argument(
+        "--save_metrics",
+        type=str,
+        default=None,
+        help="Path to save metrics summary as JSON file (e.g., ./output/metrics.json)"
     )
     
     args = parser.parse_args()
