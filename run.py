@@ -226,9 +226,89 @@ def get_tokenizer():
     return _tokenizer
 
 
+def estimate_tokens(text: str) -> int:
+    """Estimate token count for text using tokenizer."""
+    tokenizer = get_tokenizer()
+    if tokenizer:
+        return len(tokenizer.encode(text))
+    return len(text) // 4
+
+
+def estimate_prompt_tokens(
+    content: str,
+    question: str,
+    tools_json: str,
+    report: str = "",
+    observation: str = ""
+) -> dict:
+    """
+    Estimate token counts for each category in the prompt.
+    
+    Args:
+        content: Complete prompt content
+        question: User's question
+        tools_json: Tool definitions JSON string
+        report: Previous report content (optional)
+        observation: Tool observation content (optional)
+    
+    Returns:
+        dict with keys: system, user, tools, report, observation, total
+    """
+    system_content = content
+    for placeholder in [question, tools_json, report, observation]:
+        if placeholder:
+            system_content = system_content.replace(placeholder, "")
+    
+    return {
+        "system": estimate_tokens(system_content),
+        "user": estimate_tokens(question),
+        "tools": estimate_tokens(tools_json),
+        "report": estimate_tokens(report) if report else 0,
+        "observation": estimate_tokens(observation) if observation else 0,
+    }
+
+
+def estimate_tool_definition_tokens(tools_json: str) -> dict:
+    """
+    Estimate token counts for each tool's definition.
+    
+    Args:
+        tools_json: JSON string containing tool definitions
+    
+    Returns:
+        dict mapping tool name to token count
+    """
+    try:
+        tools = json.loads(tools_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    
+    tokenizer = get_tokenizer()
+    result = {}
+    
+    for tool in tools:
+        tool_str = json.dumps(tool, ensure_ascii=False)
+        if tokenizer:
+            tokens = len(tokenizer.encode(tool_str))
+        else:
+            tokens = len(tool_str) // 4
+        name = tool.get("name", "unknown")
+        result[name] = tokens
+    
+    return result
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
+def format_token_bar(value: int, total: int, width: int = 40) -> str:
+    """Generate aligned ASCII bar."""
+    if total == 0:
+        return "░" * width
+    ratio = value / total
+    filled = int(ratio * width)
+    return "█" * filled + "░" * (width - filled)
+
 def extract_tags(text: str, tag: str) -> str:
     """Extract content from XML-style tags."""
     pattern = r"<{TAG}>(.*?)</{TAG}>".format(TAG=tag)
@@ -286,6 +366,77 @@ def check_report_action(response) -> tuple:
         return False, 'No valid answer or tool call!'
     
     return True, 'success'
+
+
+def _extract_cache_read_tokens(usage) -> int:
+    """Extract cached prompt tokens from Aliyun/OpenAI-compatible usage payloads.
+
+    The official Aliyun doc exposes cache hit tokens as:
+    usage.prompt_tokens_details.cached_tokens
+    """
+    if not usage:
+        return 0
+
+    def _search(value):
+        if isinstance(value, dict):
+            prompt_details = value.get("prompt_tokens_details")
+            if isinstance(prompt_details, dict):
+                cached_tokens = prompt_details.get("cached_tokens")
+                if isinstance(cached_tokens, (int, float)):
+                    return int(cached_tokens)
+
+            for key in ("cached_tokens", "cache_read_tokens", "cached_prompt_tokens"):
+                token_value = value.get(key)
+                if isinstance(token_value, (int, float)):
+                    return int(token_value)
+
+            for nested_key in ("prompt_token_details", "prompt_tokens_detail", "details"):
+                nested_value = value.get(nested_key)
+                if nested_value is not None:
+                    nested_tokens = _search(nested_value)
+                    if nested_tokens:
+                        return nested_tokens
+
+        else:
+            prompt_details = getattr(value, "prompt_tokens_details", None)
+            if prompt_details is not None:
+                cached_tokens = getattr(prompt_details, "cached_tokens", None)
+                if isinstance(cached_tokens, (int, float)):
+                    return int(cached_tokens)
+
+            for key in ("cached_tokens", "cache_read_tokens", "cached_prompt_tokens"):
+                token_value = getattr(value, key, None)
+                if isinstance(token_value, (int, float)):
+                    return int(token_value)
+
+            for nested_key in ("prompt_token_details", "prompt_tokens_detail", "details"):
+                nested_value = getattr(value, nested_key, None)
+                if nested_value is not None:
+                    nested_tokens = _search(nested_value)
+                    if nested_tokens:
+                        return nested_tokens
+
+        return 0
+
+    return _search(usage)
+
+
+def _get_effective_tool_calls(tool_name: str, arguments: dict) -> int:
+    """Return the weighted call count for tools that accept batched queries.
+
+    Search tools may receive a question/query list. In that case, one tool
+    invocation can trigger multiple API requests, so we count the effective
+    calls as the length of the query list.
+    """
+    if tool_name in {'google_search', 'baidu_search', 'aliyun_iqs_search', 'google_scholar'}:
+        query = arguments.get('query', []) if isinstance(arguments, dict) else []
+        if isinstance(query, (list, tuple)):
+            return len(query)
+        if isinstance(query, str) and query.strip():
+            return 1
+        return 0
+
+    return 1
 
 
 # =============================================================================
@@ -360,6 +511,8 @@ def call_llm(
             prompt_tokens = response.usage.get('prompt_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
             completion_tokens = response.usage.get('completion_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
             
+            cache_read_tokens = _extract_cache_read_tokens(response.usage if hasattr(response, 'usage') else None)
+            
             llm_success = True
             if check_format:
                 is_valid, reason = check_report_action(response)
@@ -375,7 +528,8 @@ def call_llm(
                 completion_tokens=completion_tokens,
                 latency_ms=llm_call_latency_ms,
                 turn=turn,
-                success=llm_success
+                success=llm_success,
+                cache_read_tokens=cache_read_tokens
             )
             
             if not llm_success:
@@ -447,6 +601,7 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
     """
     tool_start_time = time.time()
     metrics = get_metrics_collector()
+    effective_calls = _get_effective_tool_calls(tool_name, arguments)
     
     try:
         if tool_name == 'google_search':
@@ -459,14 +614,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="SearchFailed"
+                    error="SearchFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, []
         
@@ -480,14 +637,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="SearchFailed"
+                    error="SearchFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, []
         
@@ -501,14 +660,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="SearchFailed"
+                    error="SearchFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, []
         
@@ -528,14 +689,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="SearchFailed"
+                    error="SearchFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, []
         
@@ -553,14 +716,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="ExecutionFailed"
+                    error="ExecutionFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, []
         
@@ -578,14 +743,16 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=False,
-                    error="VisitFailed"
+                    error="VisitFailed",
+                    effective_calls=effective_calls
                 )
             else:
                 metrics.record_tool_call(
                     tool_name=tool_name,
                     args=arguments,
                     latency_ms=latency_ms,
-                    success=True
+                    success=True,
+                    effective_calls=effective_calls
                 )
             return result, summary_messages
         
@@ -595,7 +762,8 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                 tool_name=tool_name,
                 args=arguments,
                 latency_ms=(time.time() - tool_start_time) * 1000,
-                success=True
+                success=True,
+                effective_calls=effective_calls
             )
             return result, []
             
@@ -612,7 +780,8 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
             args=arguments,
             latency_ms=tool_latency_ms,
             success=False,
-            error=error_type
+            error=error_type,
+            effective_calls=effective_calls
         )
         print(f"[{tool_name}] Failure: {error_msg}")
         return f"Tool execution error: {error_msg}", []
@@ -730,6 +899,41 @@ def agentic_loop(
         
         turn_start_time = time.time()
         metrics.start_iteration(turn=turn, query=task, action="llm_call")
+        
+        # Track token breakdown and tool definitions
+        tool_str = get_tool_str_for_engine(SEARCH_ENGINE)
+        if turn == 0:
+            # Turn 0: initial prompt
+            breakdown = estimate_prompt_tokens(
+                messages[0]['content'],
+                task,
+                tool_str
+            )
+            # Record tool definitions for Turn 0 only
+            tool_def_tokens = estimate_tool_definition_tokens(tool_str)
+            for name, tokens in tool_def_tokens.items():
+                metrics.record_tool_definition(name, tokens)
+        else:
+            # Turn N: instruction prompt with report and observation
+            content = messages[0]['content']
+            report = extract_tags(content, 'report')
+            observation = extract_tags(content, 'tool_response')
+            breakdown = estimate_prompt_tokens(
+                content,
+                task,
+                tool_str,
+                report=report,
+                observation=observation
+            )
+        
+        metrics.record_prompt_breakdown(
+            system_tokens=breakdown['system'],
+            user_tokens=breakdown['user'],
+            tools_definition_tokens=breakdown['tools'],
+            report_tokens=breakdown['report'],
+            observation_tokens=breakdown['observation'],
+            turn=turn
+        )
         
         # Get LLM response
         response = call_llm(
@@ -945,33 +1149,198 @@ def main(args):
     
     summary = metrics.get_summary()
     if summary:
-        print("\n" + "=" * 60)
+        llm_stats = summary.get('llm', {})
+        cache_stats = summary.get('cache', {})
+        
+        total_input = llm_stats.get('total_prompt_tokens', 0)
+        cache_read = cache_stats.get('cache_read_tokens', 0)
+        cache_write = cache_stats.get('cache_write_tokens', 0)
+        fresh_input = cache_stats.get('fresh_input_tokens', 0)
+        completion_tokens = llm_stats.get('total_completion_tokens', 0)
+        
+        cache_hit_rate = cache_stats.get('cache_hit_rate', 0)
+        
+        bar_width = 40
+        
+        print("\n" + "=" * 70)
         print("METRICS SUMMARY")
-        print("=" * 60)
+        print("=" * 70)
         print(f"Total Questions: {summary.get('total_questions', 0)}")
         print(f"Total Turns: {summary.get('total_turns', 0)}")
         print(f"Avg Turns/Question: {summary.get('avg_turns_per_question', 0)}")
         print(f"Answer Success Rate: {summary.get('answer_success_rate', 'N/A')}")
-        print(f"\nLLM Statistics:")
-        llm_stats = summary.get('llm', {})
-        print(f"  Total LLM Calls: {llm_stats.get('total_calls', 0)}")
-        print(f"  Total Prompt Tokens: {llm_stats.get('total_prompt_tokens', 0)}")
-        print(f"  Total Completion Tokens: {llm_stats.get('total_completion_tokens', 0)}")
-        print(f"  Total LLM Latency: {llm_stats.get('total_latency_ms', 0):.2f}ms")
-        print(f"  By Model:")
-        for model, model_stats in llm_stats.get('by_model', {}).items():
-            print(f"    {model}: {model_stats['calls']} calls, {model_stats['prompt_tokens']} prompt + {model_stats['completion_tokens']} completion tokens")
-        print(f"\nIteration Distribution:")
+        
+        print(f"\n{'─' * 70}")
+        print("LLM STATISTICS")
+        print(f"{'─' * 70}")
+        print(f"Total LLM Calls: {llm_stats.get('total_calls', 0)}")
+        print(f"Total Prompt Tokens: {llm_stats.get('total_prompt_tokens', 0):,}")
+        print(f"Total Completion Tokens: {llm_stats.get('total_completion_tokens', 0):,}")
+        print(f"Total LLM Latency: {llm_stats.get('total_latency_ms', 0):.2f}ms")
+        
+        if llm_stats.get('by_model'):
+            print(f"\nBy Model:")
+            for model, model_stats in llm_stats.get('by_model', {}).items():
+                model_cache_read = model_stats.get('cache_read_tokens', 0)
+                model_fresh = model_stats.get('prompt_tokens', 0) - model_cache_read
+                print(f"  {model}:")
+                print(f"    Calls: {model_stats['calls']}, Prompt: {model_stats['prompt_tokens']:,}, Completion: {model_stats['completion_tokens']:,}")
+                if model_cache_read > 0:
+                    print(f"    Cache: {model_cache_read:,} read, {model_fresh:,} fresh")
+        
+        if cache_read > 0 or cache_write > 0 or fresh_input > 0:
+            print(f"\n{'─' * 70}")
+            print("CACHE EFFICIENCY")
+            print(f"{'─' * 70}")
+            
+            if total_input > 0:
+                cache_bar_len = int((cache_read / total_input) * bar_width) if total_input > 0 else 0
+                fresh_bar_len = bar_width - cache_bar_len
+                cache_pct = (cache_read / total_input) * 100 if total_input > 0 else 0
+                fresh_pct = (fresh_input / total_input) * 100 if total_input > 0 else 0
+                
+                cache_bar = "█" * cache_bar_len + "░" * fresh_bar_len
+                print(f"Token Distribution:")
+                print(f"  Cache Read: {cache_read:>12,} tokens  {cache_bar}  {cache_pct:5.1f}%")
+                fresh_bar = "░" * cache_bar_len + "█" * fresh_bar_len
+                print(f"  Fresh Input: {fresh_input:>11,} tokens  {fresh_bar}  {fresh_pct:5.1f}%")
+                print(f"{'─' * 70}")
+                print(f"Cache Hit Rate: {cache_hit_rate:.1f}%")
+        
+        prompt_breakdown = summary.get('prompt_breakdown', {})
+        if prompt_breakdown.get('total', 0) > 0:
+            print(f"\n{'─' * 70}")
+            print("TOKEN BREAKDOWN BY CATEGORY")
+            print(f"{'─' * 70}")
+            print("Estimated using tokenizer analysis of message content:")
+            print()
+            print("Input Categories:")
+            
+            total_breakdown = prompt_breakdown.get('total', 0)
+            categories = [
+                ("SYSTEM", prompt_breakdown.get('system', 0)),
+                ("USER", prompt_breakdown.get('user', 0)),
+                ("TOOLS", prompt_breakdown.get('tools_definition', 0)),
+            ]
+            
+            if prompt_breakdown.get('report', 0) > 0:
+                categories.append(("REPORT", prompt_breakdown.get('report', 0)))
+            if prompt_breakdown.get('observation', 0) > 0:
+                categories.append(("OBSERVATION", prompt_breakdown.get('observation', 0)))
+            
+            for name, tokens in categories:
+                pct = (tokens / total_breakdown) * 100 if total_breakdown > 0 else 0
+                bar = format_token_bar(tokens, total_breakdown, bar_width)
+                print(f"  {name:<12} {bar}  {pct:5.1f}% ({tokens:,})")
+            
+            print()
+            print(f"  Subtotal: {total_breakdown:,} estimated input tokens")
+        
+        tool_defs_cost = summary.get('tool_definitions_cost', {})
+        if tool_defs_cost:
+            print(f"\n{'─' * 70}")
+            print("TOOL DEFINITIONS COST")
+            print(f"{'─' * 70}")
+            
+            total_tool_def_tokens = sum(tool_defs_cost.values())
+            
+            for tool_name in sorted(tool_defs_cost.keys(), key=lambda x: tool_defs_cost[x], reverse=True):
+                tokens = tool_defs_cost[tool_name]
+                pct = (tokens / total_tool_def_tokens) * 100 if total_tool_def_tokens > 0 else 0
+                bar = format_token_bar(tokens, total_tool_def_tokens, bar_width)
+                print(f"  {tool_name:<20} {bar}  {tokens:>10,} tokens")
+            
+            print(f"{'─' * 70}")
+            print(f"  Total: {total_tool_def_tokens:,} tokens")
+        
+        print(f"\n{'─' * 70}")
+        print("SESSION TOTALS")
+        print(f"{'─' * 70}")
+        print(f"Total API Calls: {llm_stats.get('total_calls', 0)}")
+        print(f"  Input tokens (fresh):     {fresh_input:>12,}")
+        print(f"  Cache read:               {cache_read:>12,}")
+        print(f"  Cache write:              {cache_write:>12,}")
+        print(f"  Output tokens:            {completion_tokens:>12,}")
+        print(f"{'─' * 70}")
+        print(f"Session Total:             {total_input + completion_tokens:>12,} tokens")
+        
+        try:
+            from pricing import calculate_cost, format_cost_usd, MODEL_PRICING
+            primary_model = summary.get('primary_model', 'qwen-flash')
+            cost_result = calculate_cost(
+                primary_model,
+                prompt_tokens=fresh_input,
+                completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write
+            )
+            
+            if cost_result["total_cost"] > 0:
+                print(f"\n{'─' * 70}")
+                print("ESTIMATED SESSION COST")
+                print(f"{'─' * 70}")
+                
+                if cost_result.get("warning"):
+                    print(f"  Note: {cost_result['warning']}")
+                    print(f"  Using estimated pricing...")
+                    print()
+                
+                pricing_info = MODEL_PRICING.get(primary_model.lower(), {})
+                input_rate = pricing_info.get("input_cost_per_token", 0) * 1_000_000
+                cache_read_rate = pricing_info.get("cache_read_input_token_cost", 0) * 1_000_000
+                cache_write_rate = pricing_info.get("cache_creation_input_token_cost", 0) * 1_000_000
+                output_rate = pricing_info.get("output_cost_per_token", 0) * 1_000_000
+                
+                print(f"  Input tokens:  {fresh_input:>10,} × ${input_rate:.4f}/M = ${cost_result['input_cost']:.4f}")
+                print(f"  Cache read:    {cache_read:>10,} × ${cache_read_rate:.4f}/M = ${cost_result['cache_read_cost']:.4f}")
+                print(f"  Cache write:   {cache_write:>10,} × ${cache_write_rate:.4f}/M = ${cost_result['cache_write_cost']:.4f}")
+                print(f"  Output tokens: {completion_tokens:>9,} × ${output_rate:.4f}/M = ${cost_result['output_cost']:.4f}")
+                print(f"{'─' * 70}")
+                print(f"ESTIMATED TOTAL: ${cost_result['total_cost']:.4f}")
+                
+                if cache_read > 0 and fresh_input > 0:
+                    without_cache = (fresh_input + cache_read) * pricing_info.get("input_cost_per_token", 0) + completion_tokens * pricing_info.get("output_cost_per_token", 0)
+                    savings = without_cache - cost_result['total_cost']
+                    savings_pct = (savings / without_cache * 100) if without_cache > 0 else 0
+                    print(f"\nCost Savings: ${savings:.4f} ({savings_pct:.1f}% reduction with caching)")
+        except ImportError:
+            pass
+        
+        print(f"\n{'─' * 70}")
+        print("ITERATION DISTRIBUTION")
+        print(f"{'─' * 70}")
         iter_dist = summary.get('iteration_distribution', {})
+        print(f"  Configured Max Turns: {args.max_turn}")
         print(f"  Min: {iter_dist.get('min', 0)}, Max: {iter_dist.get('max', 0)}, Avg: {iter_dist.get('avg', 0)}")
-        print(f"\nTool Statistics:")
+        
+        print(f"\n{'─' * 70}")
+        print("TOOL STATISTICS")
+        print(f"{'─' * 70}")
+        total_effective_search_calls = 0
+        total_raw_search_calls = 0
         for tool_name, tool_stats in summary.get('tools', {}).items():
             print(f"  {tool_name}:")
             print(f"    Calls: {tool_stats.get('calls', 0)}, Success: {tool_stats.get('success_rate', 'N/A')}")
+            effective_calls = tool_stats.get('effective_calls', 0)
+            if effective_calls and effective_calls != tool_stats.get('calls', 0):
+                print(f"    Effective Calls: {effective_calls}")
             print(f"    Avg Latency: {tool_stats.get('avg_latency_ms', 0):.2f}ms, Total: {tool_stats.get('total_latency_ms', 0):.2f}ms")
             if tool_stats.get('total_input_tokens', 0) > 0 or tool_stats.get('total_output_tokens', 0) > 0:
                 print(f"    Tokens: {tool_stats.get('total_input_tokens', 0)} input + {tool_stats.get('total_output_tokens', 0)} output")
-        print(f"\nGlobal Time: {summary.get('global_time_ms', 0):.2f}ms")
+            if tool_name in ('google_search', 'baidu_search', 'aliyun_iqs_search', 'google_scholar'):
+                total_raw_search_calls += tool_stats.get('calls', 0)
+                total_effective_search_calls += effective_calls
+
+        if total_raw_search_calls > 0:
+            print(f"\n{'─' * 70}")
+            print("SEARCH CALL STATISTICS")
+            print(f"{'─' * 70}")
+            print(f"  Raw Search Tool Invocations: {total_raw_search_calls}")
+            print(f"  Effective Search API Calls:   {total_effective_search_calls}")
+        
+        print(f"\n{'─' * 70}")
+        print(f"Global Time: {summary.get('global_time_ms', 0):.2f}ms")
+        print("=" * 70)
         
         if args.save_metrics:
             try:

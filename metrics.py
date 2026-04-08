@@ -33,6 +33,22 @@ class StepRecord:
     llm_total_latency_ms: float = 0.0
     llm_success: bool = True
     
+    # Cache stats
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    
+    @property
+    def fresh_input_tokens(self) -> int:
+        """Fresh input tokens (total - cache_read)."""
+        return max(0, self.llm_prompt_tokens - self.cache_read_tokens)
+    
+    # Token breakdown for input (using tokenizer)
+    system_tokens: int = 0
+    user_tokens: int = 0
+    tools_definition_tokens: int = 0
+    report_tokens: int = 0
+    observation_tokens: int = 0
+    
     # Tool stats
     tool_latency_ms: float = 0.0
     tool_success: bool = True
@@ -51,6 +67,7 @@ class ToolStats:
     failed_calls: int = 0
     total_latency_ms: float = 0.0
     total_cost_estimate: float = 0.0
+    effective_calls: int = 0
     
     # Per-call cost estimation (can be customized per tool)
     cost_per_call: float = 0.0
@@ -77,6 +94,7 @@ class ToolStats:
     def to_dict(self) -> Dict:
         return {
             "calls": self.total_calls,
+            "effective_calls": self.effective_calls,
             "success_count": self.successful_calls,
             "failed_count": self.failed_calls,
             "success_rate": self.success_rate,
@@ -97,14 +115,16 @@ class MetricsCollector:
     - LLM call statistics by model and iteration
     - Tool execution statistics
     - Latency breakdown per iteration
+    - Cache efficiency statistics
     """
     
     def __init__(self):
         self._lock = threading.Lock()
+        self._thread_local = threading.local()
         
         # Per-question data
-        self.current_question: Optional[str] = None
-        self.current_question_records: List[StepRecord] = []
+        self.current_question = None
+        self.current_question_records = []
         
         # Aggregated stats
         self.all_question_metrics: List[Dict] = []
@@ -115,6 +135,21 @@ class MetricsCollector:
         self.total_completion_tokens: int = 0
         self.total_llm_latency_ms: float = 0.0
         
+        # Global Cache stats
+        self.total_cache_read_tokens: int = 0
+        self.total_cache_write_tokens: int = 0
+        self.total_fresh_input_tokens: int = 0
+        
+        # Token breakdown stats (using tokenizer)
+        self.total_system_tokens: int = 0
+        self.total_user_tokens: int = 0
+        self.total_tools_definition_tokens: int = 0
+        self.total_report_tokens: int = 0
+        self.total_observation_tokens: int = 0
+        
+        # Tool definitions cost tracking
+        self.tool_definitions_tokens: Dict[str, int] = {}
+        
         # LLM stats by iteration count (how many iterations each question took)
         self.iteration_counts: List[int] = []
         
@@ -124,6 +159,29 @@ class MetricsCollector:
         # Global timing
         self.global_start_time: Optional[float] = None
         self.global_end_time: Optional[float] = None
+        
+        # Model used (for pricing lookup)
+        self.primary_model: str = ""
+
+    @property
+    def current_question(self) -> Optional[str]:
+        return getattr(self._thread_local, "current_question", None)
+
+    @current_question.setter
+    def current_question(self, value: Optional[str]):
+        self._thread_local.current_question = value
+
+    @property
+    def current_question_records(self) -> List[StepRecord]:
+        records = getattr(self._thread_local, "current_question_records", None)
+        if records is None:
+            records = []
+            self._thread_local.current_question_records = records
+        return records
+
+    @current_question_records.setter
+    def current_question_records(self, value: List[StepRecord]):
+        self._thread_local.current_question_records = value
     
     def _get_or_create_tool_stats(self, tool_name: str) -> ToolStats:
         """Get or create tool stats for a tool."""
@@ -154,7 +212,9 @@ class MetricsCollector:
         completion_tokens: int,
         latency_ms: float,
         turn: int,
-        success: bool = True
+        success: bool = True,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0
     ):
         """Record an LLM call."""
         with self._lock:
@@ -162,6 +222,14 @@ class MetricsCollector:
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
             self.total_llm_latency_ms += latency_ms
+            self.total_cache_read_tokens += cache_read_tokens
+            self.total_cache_write_tokens += cache_write_tokens
+            fresh_tokens = max(0, prompt_tokens - cache_read_tokens)
+            self.total_fresh_input_tokens += fresh_tokens
+            
+            # Track primary model (first non-empty model)
+            if model and not self.primary_model:
+                self.primary_model = model
             
             # Update current record if exists
             if self.current_question_records and self.current_question_records[-1].turn == turn:
@@ -172,6 +240,40 @@ class MetricsCollector:
                 record.llm_latency_ms = latency_ms
                 record.llm_total_latency_ms = latency_ms
                 record.llm_success = success
+                record.cache_read_tokens = cache_read_tokens
+                record.cache_write_tokens = cache_write_tokens
+    
+    def record_prompt_breakdown(
+        self,
+        system_tokens: int = 0,
+        user_tokens: int = 0,
+        tools_definition_tokens: int = 0,
+        report_tokens: int = 0,
+        observation_tokens: int = 0,
+        turn: int = -1
+    ):
+        """Record token breakdown for prompt categories."""
+        with self._lock:
+            self.total_system_tokens += system_tokens
+            self.total_user_tokens += user_tokens
+            self.total_tools_definition_tokens += tools_definition_tokens
+            self.total_report_tokens += report_tokens
+            self.total_observation_tokens += observation_tokens
+            
+            # Update current record if exists
+            if self.current_question_records and self.current_question_records[-1].turn == turn:
+                record = self.current_question_records[-1]
+                record.system_tokens = system_tokens
+                record.user_tokens = user_tokens
+                record.tools_definition_tokens = tools_definition_tokens
+                record.report_tokens = report_tokens
+                record.observation_tokens = observation_tokens
+    
+    def record_tool_definition(self, name: str, definition_tokens: int):
+        """Record a tool's definition size (in tokens)."""
+        with self._lock:
+            if name not in self.tool_definitions_tokens:
+                self.tool_definitions_tokens[name] = definition_tokens
     
     def record_tool_call(
         self,
@@ -182,12 +284,14 @@ class MetricsCollector:
         error: Optional[str] = None,
         cost_estimate: float = 0.0,
         input_tokens: int = 0,
-        output_tokens: int = 0
+        output_tokens: int = 0,
+        effective_calls: int = 1
     ):
         """Record a tool call."""
         with self._lock:
             stats = self._get_or_create_tool_stats(tool_name)
             stats.total_calls += 1
+            stats.effective_calls += max(0, effective_calls)
             stats.total_latency_ms += latency_ms
             stats.total_cost_estimate += cost_estimate
             stats.total_input_tokens += input_tokens
@@ -327,8 +431,17 @@ class MetricsCollector:
                     "calls": len(model_records),
                     "prompt_tokens": sum(r.llm_prompt_tokens for r in model_records),
                     "completion_tokens": sum(r.llm_completion_tokens for r in model_records),
-                    "total_latency_ms": round(sum(r.llm_total_latency_ms for r in model_records), 2)
+                    "total_latency_ms": round(sum(r.llm_total_latency_ms for r in model_records), 2),
+                    "cache_read_tokens": sum(r.cache_read_tokens for r in model_records),
+                    "cache_write_tokens": sum(r.cache_write_tokens for r in model_records)
                 }
+            
+            # Add cache stats to question metrics
+            question_metrics["cache"] = {
+                "cache_read_tokens": sum(r.cache_read_tokens for r in self.current_question_records),
+                "cache_write_tokens": sum(r.cache_write_tokens for r in self.current_question_records),
+                "fresh_input_tokens": sum(r.fresh_input_tokens for r in self.current_question_records)
+            }
             
             # Add tool response count
             question_metrics["tool_response"] = {
@@ -362,13 +475,15 @@ class MetricsCollector:
             total_completion_all = sum(m["llm"]["total_completion_tokens"] for m in self.all_question_metrics)
             
             # Aggregate LLM by_model from all questions
-            llm_by_model = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_latency_ms": 0.0})
+            llm_by_model = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_latency_ms": 0.0, "cache_read_tokens": 0, "cache_write_tokens": 0})
             for m in self.all_question_metrics:
                 for model, model_stats in m["llm"].get("by_model", {}).items():
                     llm_by_model[model]["calls"] += model_stats["calls"]
                     llm_by_model[model]["prompt_tokens"] += model_stats["prompt_tokens"]
                     llm_by_model[model]["completion_tokens"] += model_stats["completion_tokens"]
                     llm_by_model[model]["total_latency_ms"] += model_stats.get("total_latency_ms", 0)
+                    llm_by_model[model]["cache_read_tokens"] += model_stats.get("cache_read_tokens", 0)
+                    llm_by_model[model]["cache_write_tokens"] += model_stats.get("cache_write_tokens", 0)
             
             # Aggregate total latency from all questions
             total_latency_all = sum(m["llm"].get("total_llm_latency_ms", 0) for m in self.all_question_metrics)
@@ -378,6 +493,16 @@ class MetricsCollector:
             for tool_name in self.tool_stats:
                 stats = self.tool_stats[tool_name]
                 aggregated_tool_stats[tool_name] = stats.to_dict()
+            
+            # Calculate cache efficiency
+            cache_read = self.total_cache_read_tokens
+            cache_write = self.total_cache_write_tokens
+            total_input = total_prompt_all
+            fresh_input = max(0, total_input - cache_read)
+            
+            cache_hit_rate = 0.0
+            if total_input > 0:
+                cache_hit_rate = (cache_read / total_input) * 100
             
             return {
                 "total_questions": total_questions,
@@ -392,7 +517,31 @@ class MetricsCollector:
                     "total_completion_tokens": total_completion_all,
                     "total_tokens": total_prompt_all + total_completion_all,
                     "total_latency_ms": round(total_latency_all, 2),
+                    "cache_read_tokens": cache_read,
+                    "cache_write_tokens": cache_write,
+                    "fresh_input_tokens": fresh_input,
                     "by_model": dict(llm_by_model)
+                },
+                "cache": {
+                    "cache_read_tokens": cache_read,
+                    "cache_write_tokens": cache_write,
+                    "fresh_input_tokens": fresh_input,
+                    "total_input_tokens": total_input,
+                    "cache_hit_rate": round(cache_hit_rate, 2),
+                    "cache_hit_rate_str": f"{cache_hit_rate:.1f}%"
+                },
+                "prompt_breakdown": {
+                    "system": self.total_system_tokens,
+                    "user": self.total_user_tokens,
+                    "tools_definition": self.total_tools_definition_tokens,
+                    "report": self.total_report_tokens,
+                    "observation": self.total_observation_tokens,
+                    "total": (self.total_system_tokens + self.total_user_tokens + 
+                             self.total_tools_definition_tokens + self.total_report_tokens + 
+                             self.total_observation_tokens)
+                },
+                "tool_definitions_cost": {
+                    tool: tokens for tool, tokens in self.tool_definitions_tokens.items()
                 },
                 "iteration_distribution": {
                     "min": min(self.iteration_counts) if self.iteration_counts else 0,
@@ -400,7 +549,8 @@ class MetricsCollector:
                     "avg": round(sum(self.iteration_counts) / len(self.iteration_counts), 2) if self.iteration_counts else 0
                 },
                 "tools": aggregated_tool_stats,
-                "global_time_ms": round((self.global_end_time - self.global_start_time) * 1000, 2) if self.global_end_time and self.global_start_time else 0
+                "global_time_ms": round((self.global_end_time - self.global_start_time) * 1000, 2) if self.global_end_time and self.global_start_time else 0,
+                "primary_model": self.primary_model
             }
 
 
