@@ -14,6 +14,7 @@ import random
 import argparse
 import traceback
 import requests
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -421,6 +422,158 @@ def _extract_cache_read_tokens(usage) -> int:
     return _search(usage)
 
 
+def _extract_usage_number(usage, *path_candidates) -> int:
+    """Extract numeric usage field from dict/object payload by candidate paths."""
+    if usage is None:
+        return 0
+
+    def _get(value, key):
+        if isinstance(value, dict):
+            return value.get(key)
+        return getattr(value, key, None)
+
+    for path in path_candidates:
+        current = usage
+        found = True
+        for key in path:
+            current = _get(current, key)
+            if current is None:
+                found = False
+                break
+        if found and isinstance(current, (int, float)):
+            return int(current)
+
+    return 0
+
+
+def _extract_cache_write_tokens(usage) -> int:
+    """Extract cache-miss/write tokens across DeepSeek/OpenAI-compatible payloads."""
+    if not usage:
+        return 0
+
+    # DeepSeek official fields
+    deepseek_miss = _extract_usage_number(usage, ("prompt_cache_miss_tokens",))
+    if deepseek_miss > 0:
+        return deepseek_miss
+
+    # Fallback aliases for compatible gateways
+    return _extract_usage_number(
+        usage,
+        ("prompt_tokens_details", "cache_miss_tokens"),
+        ("prompt_token_details", "cache_miss_tokens"),
+        ("cache_write_tokens",),
+        ("cached_prompt_miss_tokens",)
+    )
+
+
+def _parse_usage_tokens(usage) -> dict:
+    """Parse prompt/completion/cache tokens from heterogeneous usage payloads."""
+    prompt_tokens = _extract_usage_number(
+        usage,
+        ("prompt_tokens",),
+        ("input_tokens",),
+        ("usage", "prompt_tokens")
+    )
+    completion_tokens = _extract_usage_number(
+        usage,
+        ("completion_tokens",),
+        ("output_tokens",),
+        ("generated_tokens",),
+        ("usage", "completion_tokens")
+    )
+
+    cache_read_tokens = _extract_usage_number(
+        usage,
+        ("prompt_cache_hit_tokens",),  # DeepSeek
+        ("prompt_tokens_details", "cached_tokens")  # DashScope/OpenAI-compatible
+    )
+    if cache_read_tokens == 0:
+        cache_read_tokens = _extract_cache_read_tokens(usage)
+
+    cache_write_tokens = _extract_cache_write_tokens(usage)
+
+    # DeepSeek returns hit/miss explicitly; reconstruct prompt_tokens if absent.
+    if prompt_tokens == 0 and (cache_read_tokens > 0 or cache_write_tokens > 0):
+        prompt_tokens = cache_read_tokens + cache_write_tokens
+
+    # Fallback for some providers that return details-only output token count.
+    if completion_tokens == 0:
+        completion_tokens = _extract_usage_number(
+            usage,
+            ("completion_tokens_details", "reasoning_tokens"),
+            ("output_tokens_details", "reasoning_tokens")
+        )
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens
+    }
+
+
+def _detect_provider_from_url(llm_url: str) -> str:
+    """Detect provider type by configured base URL/endpoint URL."""
+    if not llm_url:
+        return "openai-compatible"
+
+    parsed = urlparse(llm_url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    if "deepseek" in host:
+        return "deepseek"
+    if "dashscope" in host or ("aliyuncs.com" in host and "compatible-mode" in path):
+        return "dashscope"
+    return "openai-compatible"
+
+
+def _normalize_llm_endpoint(llm_url: str) -> str:
+    """Normalize user-provided endpoint/base_url to chat completions endpoint."""
+    if not llm_url:
+        return llm_url
+
+    parsed = urlparse(llm_url)
+    path = (parsed.path or "").rstrip("/")
+
+    if path.endswith("/chat/completions"):
+        return llm_url
+
+    if path.endswith("/v1"):
+        new_path = f"{path}/chat/completions"
+    elif path.endswith("/compatible-mode"):
+        new_path = f"{path}/v1/chat/completions"
+    elif path.endswith("/compatible-mode/v1"):
+        new_path = f"{path}/chat/completions"
+    elif path in ("", "/"):
+        new_path = "/chat/completions"
+    else:
+        new_path = f"{path}/chat/completions"
+
+    return parsed._replace(path=new_path).geturl()
+
+
+def _adapt_model_for_provider(model_name: str, provider: str) -> str:
+    """Adapt default model name for provider-specific endpoints when needed."""
+    if provider != "deepseek":
+        return model_name
+
+    if not model_name:
+        return "deepseek-chat"
+
+    model_lower = model_name.lower()
+    if model_lower.startswith("deepseek-"):
+        return model_name
+
+    # Keep compatibility with existing defaults in this repo (qwen-*),
+    # while DeepSeek API only accepts deepseek-* model ids.
+    if model_lower in {"qwen-flash", "qwen-plus", "qwen-max", "qwen-long", "qwen-coder-plus"}:
+        print(f"[LLM] DeepSeek endpoint detected, remapping model '{model_name}' -> 'deepseek-chat'")
+        return "deepseek-chat"
+
+    return model_name
+
+
 def _get_effective_tool_calls(tool_name: str, arguments: dict) -> int:
     """Return the weighted call count for tools that accept batched queries.
 
@@ -474,6 +627,9 @@ def call_llm(
     call_start_time = time.time()
     
     model_name = model or RESEARCH_MODEL
+    provider = _detect_provider_from_url(llm_url)
+    model_name = _adapt_model_for_provider(model_name, provider)
+    endpoint = _normalize_llm_endpoint(llm_url)
     
     for attempt in range(max_retries):
         try:
@@ -484,9 +640,9 @@ def call_llm(
                 "top_p": 0.95,
                 "presence_penalty": 1.5
             }
-            
+            # TODO : Add Deepseek Entrance for LLM calls and metrics collection
             llm_call_start = time.time()
-            resp = requests.post(llm_url, headers=headers, json=payload, timeout=300)
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=300)
             llm_call_latency_ms = (time.time() - llm_call_start) * 1000
             
             if resp.status_code != 200:
@@ -508,10 +664,13 @@ def call_llm(
             total_call += 1
             
             metrics = get_metrics_collector()
-            prompt_tokens = response.usage.get('prompt_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
-            completion_tokens = response.usage.get('completion_tokens', 0) if hasattr(response, 'usage') and response.usage else 0
-            
-            cache_read_tokens = _extract_cache_read_tokens(response.usage if hasattr(response, 'usage') else None)
+            usage_tokens = _parse_usage_tokens(response.usage if hasattr(response, 'usage') else None)
+            prompt_tokens = usage_tokens.get('prompt_tokens', 0)
+            completion_tokens = usage_tokens.get('completion_tokens', 0)
+            cache_read_tokens = usage_tokens.get('cache_read_tokens', 0)
+            cache_write_tokens = usage_tokens.get('cache_write_tokens', 0)
+
+            effective_model = response.get('model', model_name) if isinstance(response, dict) else getattr(response, 'model', model_name)
             
             llm_success = True
             if check_format:
@@ -523,13 +682,14 @@ def call_llm(
                     print(f"Response: {response}")
             
             metrics.record_llm_call(
-                model=model_name,
+                model=effective_model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 latency_ms=llm_call_latency_ms,
                 turn=turn,
                 success=llm_success,
-                cache_read_tokens=cache_read_tokens
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens
             )
             
             if not llm_success:
@@ -1149,6 +1309,7 @@ def main(args):
     
     summary = metrics.get_summary()
     if summary:
+        json.dump(summary, open(os.path.join(args.output_path, f"{args.prefix}_summary_{current_time}.json"), 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
         llm_stats = summary.get('llm', {})
         cache_stats = summary.get('cache', {})
         
