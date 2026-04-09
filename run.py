@@ -1936,7 +1936,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_completion_tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Maximum completion tokens for main LLM responses"
     )
     parser.add_argument(
