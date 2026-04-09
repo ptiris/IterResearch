@@ -211,6 +211,7 @@ DISABLE_GOOGLE_SCHOLAR = False
 EVALUATOR_ENABLED = True
 EVALUATOR_LLM_URL_CONFIG = LLM_URL
 EVALUATOR_MODEL = "qwen-flash"
+MAX_COMPLETION_TOKENS_CONFIG = 4096
 
 # Statistics
 failed_call = 0
@@ -915,10 +916,12 @@ def call_llm(
             payload = {
                 "model": model_name,
                 "messages": request_messages,
-                "temperature": 0.6,
-                "top_p": 0.95,
+                "temperature": 0.2,
+                "top_p": 0.80,
                 "presence_penalty": 1.5
             }
+            if MAX_COMPLETION_TOKENS_CONFIG and MAX_COMPLETION_TOKENS_CONFIG > 0:
+                payload["max_tokens"] = MAX_COMPLETION_TOKENS_CONFIG
             if provider == "deepseek" and check_format:
                 payload["response_format"] = {"type": "json_object"}
             # TODO : Add Deepseek Entrance for LLM calls and metrics collection
@@ -1528,6 +1531,7 @@ def main(args):
     global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
     global visit_tool, DISABLE_GOOGLE_SCHOLAR
     global EVALUATOR_ENABLED, EVALUATOR_LLM_URL_CONFIG, EVALUATOR_MODEL
+    global MAX_COMPLETION_TOKENS_CONFIG
     
     SEARCH_ENGINE = args.search_engine
     DISABLE_GOOGLE_SCHOLAR = args.disable_google_scholar
@@ -1537,6 +1541,7 @@ def main(args):
     TOKENIZER_PATH_CONFIG = args.tokenizer_path
     MAX_OBSERVATION_TOKENS_CONFIG = args.max_observation_tokens
     MAX_WEBPAGE_TOKENS_CONFIG = args.max_webpage_tokens
+    MAX_COMPLETION_TOKENS_CONFIG = args.max_completion_tokens
     EVALUATOR_ENABLED = not args.disable_evaluator
     EVALUATOR_LLM_URL_CONFIG = args.evaluator_llm_url
     EVALUATOR_MODEL = args.evaluator_model
@@ -1556,6 +1561,7 @@ def main(args):
     print(f"Using tokenizer path: {TOKENIZER_PATH_CONFIG}")
     print(f"Max observation tokens: {MAX_OBSERVATION_TOKENS_CONFIG}")
     print(f"Max webpage tokens: {MAX_WEBPAGE_TOKENS_CONFIG}")
+    print(f"Max completion tokens: {MAX_COMPLETION_TOKENS_CONFIG}")
     print(f"Google Scholar: {'disabled' if DISABLE_GOOGLE_SCHOLAR else 'enabled'}")
     print(f"Evaluator: {'enabled' if EVALUATOR_ENABLED else 'disabled'}")
     if EVALUATOR_ENABLED:
@@ -1926,6 +1932,12 @@ if __name__ == "__main__":
         type=int,
         default=MAX_WEBPAGE_TOKENS,
         help="Maximum tokens for webpage content"
+    )
+    parser.add_argument(
+        "--max_completion_tokens",
+        type=int,
+        default=4096,
+        help="Maximum completion tokens for main LLM responses"
     )
     parser.add_argument(
         "--disable_google_scholar",
