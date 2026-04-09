@@ -10,6 +10,7 @@ import time
 import copy
 import uuid
 import requests
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import List, Union, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -94,6 +95,62 @@ def _parse_json_output(raw: str) -> Optional[dict]:
             return json.loads(raw)
         except:
             return None
+
+
+def _detect_provider_from_url(llm_url: str) -> str:
+    """Detect provider by endpoint URL."""
+    if not llm_url:
+        return "openai-compatible"
+
+    parsed = urlparse(llm_url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    if "deepseek" in host:
+        return "deepseek"
+    if "dashscope" in host or ("aliyuncs.com" in host and "compatible-mode" in path):
+        return "dashscope"
+    return "openai-compatible"
+
+
+def _normalize_llm_endpoint(llm_url: str) -> str:
+    """Normalize URL to chat completions endpoint."""
+    if not llm_url:
+        return llm_url
+
+    parsed = urlparse(llm_url)
+    path = (parsed.path or "").rstrip("/")
+
+    if path.endswith("/chat/completions"):
+        return llm_url
+    if path.endswith("/v1"):
+        new_path = f"{path}/chat/completions"
+    elif path.endswith("/compatible-mode"):
+        new_path = f"{path}/v1/chat/completions"
+    elif path.endswith("/compatible-mode/v1"):
+        new_path = f"{path}/chat/completions"
+    elif path in ("", "/"):
+        new_path = "/chat/completions"
+    else:
+        new_path = f"{path}/chat/completions"
+
+    return parsed._replace(path=new_path).geturl()
+
+
+def _adapt_model_for_provider(model_name: str, provider: str) -> str:
+    """Adapt model name for provider specific constraints."""
+    if provider != "deepseek":
+        return model_name
+
+    model = (model_name or "").strip().lower()
+    if model.startswith("deepseek-"):
+        return model_name
+
+    if model in {"qwen-flash", "qwen-plus", "qwen-max", "qwen-long", "qwen-coder-plus"}:
+        return "deepseek-chat"
+
+    # Safe fallback for unknown/non-deepseek model ids on DeepSeek endpoint.
+    return "deepseek-chat"
 
 
 class Visit:
@@ -437,26 +494,42 @@ class Visit:
         """
         if not self.summary_llm_url:
             return None, 0, 0, 0.0
+
+        provider = _detect_provider_from_url(self.summary_llm_url)
+        endpoint = _normalize_llm_endpoint(self.summary_llm_url)
+        model_name = _adapt_model_for_provider(self.summary_model, provider)
+
         print("=== Calling summary LLM ===")
-        print(self.summary_llm_url)
+        print(endpoint)
         headers = {'Content-Type': 'application/json'}
         if self.summary_llm_auth:
-            headers['Authorization'] = self.summary_llm_auth
+            auth = self.summary_llm_auth.strip()
+            if auth.lower().startswith('bearer '):
+                headers['Authorization'] = auth
+            else:
+                headers['Authorization'] = f"Bearer {auth}"
         
+        # DeepSeek often rejects overly large max_tokens; keep a safe cap.
+        max_tokens = 24000
+        if provider == "deepseek":
+            max_tokens = 8000
+
         payload = {
-            "model": self.summary_model,
+            "model": model_name,
             "messages": messages,
             "temperature": 0.7,
             "top_p": 0.8,
-            "max_tokens": 24000,
+            "max_tokens": max_tokens,
         }
+        if provider == "deepseek":
+            payload["response_format"] = {"type": "json_object"}
         
         start_time = time.time()
         
         for attempt in range(5):
             try:
                 response = requests.post(
-                    self.summary_llm_url,
+                    endpoint,
                     headers=headers,
                     json=payload,
                     timeout=120
