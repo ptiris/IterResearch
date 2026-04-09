@@ -14,6 +14,7 @@ import random
 import argparse
 import traceback
 import requests
+import threading
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from tqdm import tqdm
@@ -207,10 +208,14 @@ TOKENIZER_PATH_CONFIG = TOKENIZER_PATH
 MAX_OBSERVATION_TOKENS_CONFIG = MAX_OBSERVATION_TOKENS
 MAX_WEBPAGE_TOKENS_CONFIG = MAX_WEBPAGE_TOKENS
 DISABLE_GOOGLE_SCHOLAR = False
+EVALUATOR_ENABLED = True
+EVALUATOR_LLM_URL_CONFIG = LLM_URL
+EVALUATOR_MODEL = "qwen-flash"
 
 # Statistics
 failed_call = 0
 total_call = 0
+CALL_COUNTER_LOCK = threading.Lock()
 
 # Tokenizer for observation length control
 _tokenizer = None
@@ -348,13 +353,11 @@ def check_report_action(response) -> tuple:
     report = extract_tags(text, 'report')
     action = extract_tags(text, 'tool_call')
     answer = extract_tags(text, 'answer')
+    tool_call = None
     print(f"Tool call extracted: {action}")
     if action:
-        try:
-            tool_call = json.loads(action)
-            assert isinstance(tool_call, dict)
-            assert 'arguments' in tool_call
-        except:
+        tool_call = parse_tool_call_payload(action)
+        if not (isinstance(tool_call, dict) and 'arguments' in tool_call):
             return False, 'Tool parse error!'
     
     if not report:
@@ -367,6 +370,100 @@ def check_report_action(response) -> tuple:
         return False, 'No valid answer or tool call!'
     
     return True, 'success'
+
+
+def _normalize_llm_content_for_check(raw_content: str) -> str:
+    """Normalize JSON-mode output to the legacy tag format required by downstream logic."""
+    if not isinstance(raw_content, str):
+        raw_content = str(raw_content or "")
+
+    content = raw_content.strip()
+    if not content:
+        return ""
+
+    # Native tag format, keep as-is.
+    if "<report>" in content and ("<tool_call>" in content or "<answer>" in content):
+        return content
+
+    parsed = _extract_json_object(content)
+    if not parsed:
+        return content
+
+    # Preferred JSON mode envelope.
+    wrapped_content = parsed.get("content")
+    if isinstance(wrapped_content, str) and wrapped_content.strip():
+        wrapped_content = wrapped_content.strip()
+        if "<report>" in wrapped_content and ("<tool_call>" in wrapped_content or "<answer>" in wrapped_content):
+            return wrapped_content
+
+    report = parsed.get("report", "")
+    tool_call = parsed.get("tool_call", "")
+    answer = parsed.get("answer", "")
+
+    if report and not isinstance(report, str):
+        report = str(report)
+    if answer and not isinstance(answer, str):
+        answer = str(answer)
+    if isinstance(tool_call, dict):
+        tool_call = json.dumps(tool_call, ensure_ascii=False)
+    elif tool_call and not isinstance(tool_call, str):
+        tool_call = str(tool_call)
+
+    sections = []
+    if report:
+        sections.append(f"<report>\n{report.strip()}\n</report>")
+    if tool_call:
+        sections.append(f"<tool_call>\n{tool_call.strip()}\n</tool_call>")
+    if answer:
+        sections.append(f"<answer>\n{answer.strip()}\n</answer>")
+
+    return "\n\n".join(sections) if sections else content
+
+
+def parse_tool_call_payload(action_text: str):
+    """Parse tool_call payload with tolerant fallbacks for escaped JSON variants."""
+    if not action_text or not isinstance(action_text, str):
+        return None
+
+    candidate = action_text.strip()
+    if not candidate:
+        return None
+
+    # 1) Direct JSON object.
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # 2) JSON string that contains an object text.
+    try:
+        parsed = json.loads(f'"{candidate}"')
+        if isinstance(parsed, str):
+            nested = json.loads(parsed)
+            if isinstance(nested, dict):
+                return nested
+    except Exception:
+        pass
+
+    # 3) Relaxed cleanup for common double-escaped model outputs.
+    repaired = candidate
+    repaired = repaired.replace('\\"', '"')
+    repaired = repaired.replace('\\n', '\n').replace('\\t', '\t')
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # 4) Last resort: extract first JSON object snippet.
+    parsed = _extract_json_object(repaired)
+    if isinstance(parsed, dict) and parsed:
+        return parsed
+
+    return None
 
 
 def _extract_cache_read_tokens(usage) -> int:
@@ -592,6 +689,179 @@ def _get_effective_tool_calls(tool_name: str, arguments: dict) -> int:
     return 1
 
 
+def normalize_reference_answer(answer_value) -> str:
+    """Normalize answer/answers field to plain text for evaluation."""
+    if answer_value is None:
+        return ""
+    if isinstance(answer_value, str):
+        return answer_value.strip()
+    if isinstance(answer_value, (list, tuple)):
+        return "\n".join(str(x).strip() for x in answer_value if str(x).strip())
+    if isinstance(answer_value, dict):
+        return json.dumps(answer_value, ensure_ascii=False)
+    return str(answer_value).strip()
+
+
+def extract_final_answer_text(records: list) -> str:
+    """Extract final answer text from assistant records."""
+    for message in reversed(records):
+        if message.get('role') != 'assistant':
+            continue
+        content = message.get('content', '') or ''
+        tagged_answer = extract_tags(content, 'answer')
+        if tagged_answer:
+            return tagged_answer.strip()
+    return ""
+
+
+def _extract_json_object(text: str) -> dict:
+    """Extract the first JSON object from a text blob."""
+    if not text:
+        return {}
+
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+
+    try:
+        parsed = json.loads(match.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return {}
+    return {}
+
+
+def evaluate_answer_with_llm(
+    question: str,
+    predicted_answer: str,
+    reference_answer: str,
+    llm_url: str,
+    model: str
+) -> dict:
+    """Evaluate predicted answer against reference answer using an LLM judge."""
+    if not predicted_answer.strip():
+        return {
+            "evaluated": False,
+            "is_correct": False,
+            "score": 0.0,
+            "reason": "empty_predicted_answer",
+            "judge_model": model,
+            "judge_raw": ""
+        }
+
+    if not reference_answer.strip():
+        return {
+            "evaluated": False,
+            "is_correct": None,
+            "score": None,
+            "reason": "missing_reference_answer",
+            "judge_model": model,
+            "judge_raw": ""
+        }
+
+    provider = _detect_provider_from_url(llm_url)
+    model_name = _adapt_model_for_provider(model, provider)
+    endpoint = _normalize_llm_endpoint(llm_url)
+
+    headers = {'Content-Type': 'application/json'}
+    if OPENAI_API_KEY:
+        headers['Authorization'] = f'Bearer {OPENAI_API_KEY}'
+
+    judge_instruction = (
+        "You are a strict evaluator. Compare the predicted answer with the reference answer. "
+        "Focus on factual correctness, key entities, numbers, and required conclusions. "
+        "Respond with JSON only using this schema: "
+        "{\"is_correct\": boolean, \"score\": number, \"reason\": string}. "
+        "score must be between 0 and 1."
+    )
+    judge_input = (
+        f"Question:\n{question}\n\n"
+        f"Reference Answer:\n{reference_answer}\n\n"
+        f"Predicted Answer:\n{predicted_answer}\n"
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": judge_instruction},
+            {"role": "user", "content": judge_input}
+        ],
+        "temperature": 0
+    }
+    if provider == "deepseek":
+        payload["response_format"] = {"type": "json_object"}
+
+    try:
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+        if resp.status_code != 200:
+            return {
+                "evaluated": False,
+                "is_correct": None,
+                "score": None,
+                "reason": f"judge_http_{resp.status_code}",
+                "judge_model": model_name,
+                "judge_raw": resp.text[:1000]
+            }
+
+        response_json = resp.json()
+        content = ""
+        try:
+            content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        except Exception:
+            content = ""
+
+        parsed = _extract_json_object(content)
+        if not parsed:
+            return {
+                "evaluated": False,
+                "is_correct": None,
+                "score": None,
+                "reason": "judge_invalid_json",
+                "judge_model": model_name,
+                "judge_raw": content[:1000]
+            }
+
+        raw_score = parsed.get("score", 0)
+        try:
+            score = float(raw_score)
+        except Exception:
+            score = 0.0
+        score = max(0.0, min(1.0, score))
+
+        is_correct = parsed.get("is_correct")
+        if not isinstance(is_correct, bool):
+            is_correct = score >= 0.5
+
+        reason = str(parsed.get("reason", "")).strip()[:1000]
+
+        return {
+            "evaluated": True,
+            "is_correct": is_correct,
+            "score": round(score, 4),
+            "reason": reason,
+            "judge_model": model_name,
+            "judge_raw": content[:2000]
+        }
+    except Exception as e:
+        return {
+            "evaluated": False,
+            "is_correct": None,
+            "score": None,
+            "reason": f"judge_exception:{type(e).__name__}",
+            "judge_model": model_name,
+            "judge_raw": str(e)[:1000]
+        }
+
+
 # =============================================================================
 # LLM Interface
 # =============================================================================
@@ -633,13 +903,24 @@ def call_llm(
     
     for attempt in range(max_retries):
         try:
+            request_messages = messages
+            if provider == "deepseek" and check_format:
+                json_mode_guard = (
+                    "You must output a valid JSON object only. "
+                    "Put your full response that follows user-required tags (<report>/<tool_call>/<answer>) "
+                    "inside key 'content'."
+                )
+                request_messages = [{"role": "system", "content": json_mode_guard}] + messages
+
             payload = {
                 "model": model_name,
-                "messages": messages,
+                "messages": request_messages,
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "presence_penalty": 1.5
             }
+            if provider == "deepseek" and check_format:
+                payload["response_format"] = {"type": "json_object"}
             # TODO : Add Deepseek Entrance for LLM calls and metrics collection
             llm_call_start = time.time()
             resp = requests.post(endpoint, headers=headers, json=payload, timeout=300)
@@ -660,8 +941,13 @@ def call_llm(
             
             response = EasyDict(resp.json())
             assert response.choices[0].message, "No message in response"
+
+            if check_format:
+                normalized_content = _normalize_llm_content_for_check(response.choices[0].message.content)
+                response.choices[0].message.content = normalized_content
             
-            total_call += 1
+            with CALL_COUNTER_LOCK:
+                total_call += 1
             
             metrics = get_metrics_collector()
             usage_tokens = _parse_usage_tokens(response.usage if hasattr(response, 'usage') else None)
@@ -676,7 +962,8 @@ def call_llm(
             if check_format:
                 is_valid, reason = check_report_action(response)
                 if not is_valid:
-                    failed_call += 1
+                    with CALL_COUNTER_LOCK:
+                        failed_call += 1
                     llm_success = False
                     print(f"Format check failed: {reason}")
                     print(f"Response: {response}")
@@ -1054,6 +1341,8 @@ def agentic_loop(
     summary_records = []
     usage = {'prompt_tokens': 0, 'completion_tokens': 0}
     
+    last_tool_call = None
+
     for turn in range(max_turn):
         print(f"Turn {turn + 1}/{max_turn}")
         
@@ -1125,10 +1414,7 @@ def agentic_loop(
         tool_call = None
         
         if tool_call_str:
-            try:
-                tool_call = json.loads(tool_call_str)
-            except:
-                pass
+            tool_call = parse_tool_call_payload(tool_call_str)
         
         # If no tool call, agent has finished
         if not tool_call:
@@ -1136,6 +1422,8 @@ def agentic_loop(
             metrics.end_iteration()
             conversations.append(messages)
             break
+
+        last_tool_call = tool_call
         
         # Execute tool
         tool_name = tool_call.get('name', 'unknown')
@@ -1183,8 +1471,29 @@ def agentic_loop(
         
         messages = [{"role": "user", "content": cur_turn}]
     
+    final_answer_text = extract_final_answer_text(records)
+    reference_answer = normalize_reference_answer(answer)
+
+    evaluation_result = {
+        "evaluated": False,
+        "is_correct": None,
+        "score": None,
+        "reason": "evaluator_disabled"
+    }
+    if EVALUATOR_ENABLED:
+        evaluation_result = evaluate_answer_with_llm(
+            question=task,
+            predicted_answer=final_answer_text,
+            reference_answer=reference_answer,
+            llm_url=EVALUATOR_LLM_URL_CONFIG,
+            model=EVALUATOR_MODEL
+        )
+
     # End question and get metrics
-    question_metrics = metrics.end_question(final_answer_found=not tool_call)
+    question_metrics = metrics.end_question(
+        final_answer_found=not last_tool_call,
+        evaluation=evaluation_result
+    )
     
     result = {
         'question': task,
@@ -1192,6 +1501,7 @@ def agentic_loop(
         'records': records,
         'usage': usage,
         'conversations': conversations,
+        'evaluation': evaluation_result,
         'metrics': question_metrics
     }
     
@@ -1202,6 +1512,7 @@ def agentic_loop(
         'summary_records': summary_records,
         'usage': usage,
         'conversations': conversations,
+        'evaluation': evaluation_result,
         'metrics': question_metrics
     }
     
@@ -1216,6 +1527,7 @@ def main(args):
     global SEARCH_ENGINE, RESEARCH_MODEL, SUMMARY_LLM_URL_CONFIG, SUMMARY_MODEL
     global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
     global visit_tool, DISABLE_GOOGLE_SCHOLAR
+    global EVALUATOR_ENABLED, EVALUATOR_LLM_URL_CONFIG, EVALUATOR_MODEL
     
     SEARCH_ENGINE = args.search_engine
     DISABLE_GOOGLE_SCHOLAR = args.disable_google_scholar
@@ -1225,6 +1537,9 @@ def main(args):
     TOKENIZER_PATH_CONFIG = args.tokenizer_path
     MAX_OBSERVATION_TOKENS_CONFIG = args.max_observation_tokens
     MAX_WEBPAGE_TOKENS_CONFIG = args.max_webpage_tokens
+    EVALUATOR_ENABLED = not args.disable_evaluator
+    EVALUATOR_LLM_URL_CONFIG = args.evaluator_llm_url
+    EVALUATOR_MODEL = args.evaluator_model
     
     visit_tool = Visit(
         summary_llm_url=args.summary_llm_url,
@@ -1242,6 +1557,10 @@ def main(args):
     print(f"Max observation tokens: {MAX_OBSERVATION_TOKENS_CONFIG}")
     print(f"Max webpage tokens: {MAX_WEBPAGE_TOKENS_CONFIG}")
     print(f"Google Scholar: {'disabled' if DISABLE_GOOGLE_SCHOLAR else 'enabled'}")
+    print(f"Evaluator: {'enabled' if EVALUATOR_ENABLED else 'disabled'}")
+    if EVALUATOR_ENABLED:
+        print(f"Evaluator LLM URL: {EVALUATOR_LLM_URL_CONFIG}")
+        print(f"Evaluator model: {EVALUATOR_MODEL}")
     
     # Load input data
     all_data = []
@@ -1330,6 +1649,11 @@ def main(args):
         print(f"Total Turns: {summary.get('total_turns', 0)}")
         print(f"Avg Turns/Question: {summary.get('avg_turns_per_question', 0)}")
         print(f"Answer Success Rate: {summary.get('answer_success_rate', 'N/A')}")
+        eval_stats = summary.get('evaluation', {})
+        if eval_stats:
+            print(f"Evaluation Coverage: {eval_stats.get('evaluated_questions', 0)}/{summary.get('total_questions', 0)}")
+            print(f"Evaluation Accuracy: {eval_stats.get('accuracy_str', 'N/A')}")
+            print(f"Evaluation Avg Score: {eval_stats.get('avg_score', 0):.4f}")
         
         print(f"\n{'─' * 70}")
         print("LLM STATISTICS")
@@ -1613,6 +1937,23 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to save metrics summary as JSON file (e.g., ./output/metrics.json)"
+    )
+    parser.add_argument(
+        "--disable_evaluator",
+        action="store_true",
+        help="Disable LLM-based final answer evaluator"
+    )
+    parser.add_argument(
+        "--evaluator_llm_url",
+        type=str,
+        default=LLM_URL,
+        help="URL of the evaluator LLM endpoint"
+    )
+    parser.add_argument(
+        "--evaluator_model",
+        type=str,
+        default="qwen-flash",
+        help="Name of the model to use for final answer evaluation"
     )
     
     args = parser.parse_args()

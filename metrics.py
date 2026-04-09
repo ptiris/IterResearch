@@ -119,7 +119,7 @@ class MetricsCollector:
     """
     
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._thread_local = threading.local()
         
         # Per-question data
@@ -191,9 +191,9 @@ class MetricsCollector:
     
     def start_question(self, question: str):
         """Start tracking a new question."""
-        with self._lock:
-            self.current_question = question
-            self.current_question_records = []
+        # Thread-local context does not need global locking.
+        self.current_question = question
+        self.current_question_records = []
     
     def start_global_timer(self):
         """Start global timer for entire run."""
@@ -217,6 +217,10 @@ class MetricsCollector:
         cache_write_tokens: int = 0
     ):
         """Record an LLM call."""
+        current_record = None
+        if self.current_question_records and self.current_question_records[-1].turn == turn:
+            current_record = self.current_question_records[-1]
+
         with self._lock:
             self.total_llm_calls += 1
             self.total_prompt_tokens += prompt_tokens
@@ -230,18 +234,17 @@ class MetricsCollector:
             # Track primary model (first non-empty model)
             if model and not self.primary_model:
                 self.primary_model = model
-            
-            # Update current record if exists
-            if self.current_question_records and self.current_question_records[-1].turn == turn:
-                record = self.current_question_records[-1]
-                record.llm_model = model
-                record.llm_prompt_tokens = prompt_tokens
-                record.llm_completion_tokens = completion_tokens
-                record.llm_latency_ms = latency_ms
-                record.llm_total_latency_ms = latency_ms
-                record.llm_success = success
-                record.cache_read_tokens = cache_read_tokens
-                record.cache_write_tokens = cache_write_tokens
+
+        # Update thread-local step record without holding the global lock.
+        if current_record is not None:
+            current_record.llm_model = model
+            current_record.llm_prompt_tokens = prompt_tokens
+            current_record.llm_completion_tokens = completion_tokens
+            current_record.llm_latency_ms = latency_ms
+            current_record.llm_total_latency_ms = latency_ms
+            current_record.llm_success = success
+            current_record.cache_read_tokens = cache_read_tokens
+            current_record.cache_write_tokens = cache_write_tokens
     
     def record_prompt_breakdown(
         self,
@@ -253,21 +256,23 @@ class MetricsCollector:
         turn: int = -1
     ):
         """Record token breakdown for prompt categories."""
+        current_record = None
+        if self.current_question_records and self.current_question_records[-1].turn == turn:
+            current_record = self.current_question_records[-1]
+
         with self._lock:
             self.total_system_tokens += system_tokens
             self.total_user_tokens += user_tokens
             self.total_tools_definition_tokens += tools_definition_tokens
             self.total_report_tokens += report_tokens
             self.total_observation_tokens += observation_tokens
-            
-            # Update current record if exists
-            if self.current_question_records and self.current_question_records[-1].turn == turn:
-                record = self.current_question_records[-1]
-                record.system_tokens = system_tokens
-                record.user_tokens = user_tokens
-                record.tools_definition_tokens = tools_definition_tokens
-                record.report_tokens = report_tokens
-                record.observation_tokens = observation_tokens
+
+        if current_record is not None:
+            current_record.system_tokens = system_tokens
+            current_record.user_tokens = user_tokens
+            current_record.tools_definition_tokens = tools_definition_tokens
+            current_record.report_tokens = report_tokens
+            current_record.observation_tokens = observation_tokens
     
     def record_tool_definition(self, name: str, definition_tokens: int):
         """Record a tool's definition size (in tokens)."""
@@ -288,6 +293,8 @@ class MetricsCollector:
         effective_calls: int = 1
     ):
         """Record a tool call."""
+        current_record = self.current_question_records[-1] if self.current_question_records else None
+
         with self._lock:
             stats = self._get_or_create_tool_stats(tool_name)
             stats.total_calls += 1
@@ -303,159 +310,164 @@ class MetricsCollector:
                 stats.failed_calls += 1
                 if error:
                     stats.error_types[error] += 1
-            
-            # Update current record if exists
-            if self.current_question_records:
-                record = self.current_question_records[-1]
-                record.tool_latency_ms = latency_ms
-                record.tool_success = success
-                record.tool_error = error
+
+        if current_record is not None:
+            current_record.tool_latency_ms = latency_ms
+            current_record.tool_success = success
+            current_record.tool_error = error
     
     def start_iteration(self, turn: int, query: str, action: str):
         """Start a new iteration/step."""
-        with self._lock:
-            record = StepRecord(
-                turn=turn,
-                query=query,
-                action=action
-            )
-            self.current_question_records.append(record)
+        record = StepRecord(
+            turn=turn,
+            query=query,
+            action=action
+        )
+        self.current_question_records.append(record)
     
     def update_iteration_action(self, action: str, tool_name: str = None, tool_args: Dict = None):
         """Update the action details for current iteration."""
-        with self._lock:
-            if self.current_question_records:
-                record = self.current_question_records[-1]
-                record.action = action
-                record.tool_name = tool_name
-                record.tool_args = tool_args
+        if self.current_question_records:
+            record = self.current_question_records[-1]
+            record.action = action
+            record.tool_name = tool_name
+            record.tool_args = tool_args
     
     def update_iteration_tool_result(self, result: str, result_length: int):
         """Update tool result for current iteration."""
-        with self._lock:
-            if self.current_question_records:
-                record = self.current_question_records[-1]
-                record.tool_result = result[:1000] if result else ""
-                record.tool_result_length = result_length
+        if self.current_question_records:
+            record = self.current_question_records[-1]
+            record.tool_result = result[:1000] if result else ""
+            record.tool_result_length = result_length
     
     def end_iteration(self):
         """End current iteration and calculate total latency."""
-        with self._lock:
-            if self.current_question_records:
-                record = self.current_question_records[-1]
-                record.iteration_total_latency_ms = (
-                    record.llm_total_latency_ms + 
-                    record.tool_latency_ms
-                )
+        if self.current_question_records:
+            record = self.current_question_records[-1]
+            record.iteration_total_latency_ms = (
+                record.llm_total_latency_ms +
+                record.tool_latency_ms
+            )
     
-    def end_question(self, final_answer_found: bool = True) -> Dict:
+    def end_question(
+        self,
+        final_answer_found: bool = True,
+        evaluation: Optional[Dict[str, Any]] = None
+    ) -> Dict:
         """End tracking for current question and return metrics."""
-        with self._lock:
-            if not self.current_question_records:
-                return {}
-            
-            turns = len(self.current_question_records)
-            self.iteration_counts.append(turns)
+        local_records = list(self.current_question_records)
+        if not local_records:
+            return {}
+
+        turns = len(local_records)
             
             # Calculate question-level stats
-            total_llm_calls = sum(1 for r in self.current_question_records if r.llm_prompt_tokens > 0)
-            successful_llm_calls = sum(1 for r in self.current_question_records if r.llm_prompt_tokens > 0 and r.llm_success)
-            failed_llm_calls = sum(1 for r in self.current_question_records if r.llm_prompt_tokens > 0 and not r.llm_success)
-            total_prompt_tokens = sum(r.llm_prompt_tokens for r in self.current_question_records)
-            total_completion_tokens = sum(r.llm_completion_tokens for r in self.current_question_records)
-            total_llm_latency = sum(r.llm_total_latency_ms for r in self.current_question_records)
-            total_tool_latency = sum(r.tool_latency_ms for r in self.current_question_records)
+        total_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0)
+        successful_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0 and r.llm_success)
+        failed_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0 and not r.llm_success)
+        total_prompt_tokens = sum(r.llm_prompt_tokens for r in local_records)
+        total_completion_tokens = sum(r.llm_completion_tokens for r in local_records)
+        total_llm_latency = sum(r.llm_total_latency_ms for r in local_records)
+        total_tool_latency = sum(r.tool_latency_ms for r in local_records)
             
             # Tool usage for this question
-            tool_usage = {}
-            for record in self.current_question_records:
-                if record.tool_name:
-                    if record.tool_name not in tool_usage:
-                        tool_usage[record.tool_name] = {
-                            "calls": 0,
-                            "total_latency_ms": 0.0,
-                            "success_count": 0,
-                            "failed_count": 0
-                        }
-                    tool_usage[record.tool_name]["calls"] += 1
-                    tool_usage[record.tool_name]["total_latency_ms"] += record.tool_latency_ms
-                    if record.tool_success:
-                        tool_usage[record.tool_name]["success_count"] += 1
-                    else:
-                        tool_usage[record.tool_name]["failed_count"] += 1
+        tool_usage = {}
+        for record in local_records:
+            if record.tool_name:
+                if record.tool_name not in tool_usage:
+                    tool_usage[record.tool_name] = {
+                        "calls": 0,
+                        "total_latency_ms": 0.0,
+                        "success_count": 0,
+                        "failed_count": 0
+                    }
+                tool_usage[record.tool_name]["calls"] += 1
+                tool_usage[record.tool_name]["total_latency_ms"] += record.tool_latency_ms
+                if record.tool_success:
+                    tool_usage[record.tool_name]["success_count"] += 1
+                else:
+                    tool_usage[record.tool_name]["failed_count"] += 1
             
             # Per-iteration latency
-            iteration_latencies = [
-                {
-                    "turn": r.turn,
-                    "llm_latency_ms": round(r.llm_total_latency_ms, 2),
-                    "llm_success": r.llm_success,
-                    "tool_latency_ms": round(r.tool_latency_ms, 2),
-                    "total_latency_ms": round(r.iteration_total_latency_ms, 2),
-                    "action": r.action,
-                    "tool_name": r.tool_name,
-                    "tool_success": r.tool_success
-                }
-                for r in self.current_question_records
-            ]
-            
-            question_metrics = {
-                "total_turns": turns,
-                "final_answer_found": final_answer_found,
-                "llm": {
-                    "total_calls": total_llm_calls,
-                    "successful_calls": successful_llm_calls,
-                    "failed_calls": failed_llm_calls,
-                    "total_prompt_tokens": total_prompt_tokens,
-                    "total_completion_tokens": total_completion_tokens,
-                    "total_tokens": total_prompt_tokens + total_completion_tokens,
-                    "total_llm_latency_ms": round(total_llm_latency, 2),
-                    "avg_llm_latency_ms": round(total_llm_latency / total_llm_calls, 2) if total_llm_calls > 0 else 0,
-                    "by_model": {}
-                },
-                "tool_usage": tool_usage,
-                "total_tool_latency_ms": round(total_tool_latency, 2),
-                "iteration_latencies": iteration_latencies,
-                "latency_breakdown": {
-                    "llm_time_ms": round(total_llm_latency, 2),
-                    "tool_time_ms": round(total_tool_latency, 2),
-                    "total_time_ms": round(total_llm_latency + total_tool_latency, 2)
-                }
+        iteration_latencies = [
+            {
+                "turn": r.turn,
+                "llm_latency_ms": round(r.llm_total_latency_ms, 2),
+                "llm_success": r.llm_success,
+                "tool_latency_ms": round(r.tool_latency_ms, 2),
+                "total_latency_ms": round(r.iteration_total_latency_ms, 2),
+                "action": r.action,
+                "tool_name": r.tool_name,
+                "tool_success": r.tool_success
             }
+            for r in local_records
+        ]
+
+        question_metrics = {
+            "total_turns": turns,
+            "final_answer_found": final_answer_found,
+            "evaluation": evaluation or {
+                "evaluated": False,
+                "is_correct": None,
+                "score": None,
+                "reason": "not_evaluated"
+            },
+            "llm": {
+                "total_calls": total_llm_calls,
+                "successful_calls": successful_llm_calls,
+                "failed_calls": failed_llm_calls,
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+                "total_llm_latency_ms": round(total_llm_latency, 2),
+                "avg_llm_latency_ms": round(total_llm_latency / total_llm_calls, 2) if total_llm_calls > 0 else 0,
+                "by_model": {}
+            },
+            "tool_usage": tool_usage,
+            "total_tool_latency_ms": round(total_tool_latency, 2),
+            "iteration_latencies": iteration_latencies,
+            "latency_breakdown": {
+                "llm_time_ms": round(total_llm_latency, 2),
+                "tool_time_ms": round(total_tool_latency, 2),
+                "total_time_ms": round(total_llm_latency + total_tool_latency, 2)
+            }
+        }
             
             # Add per-model LLM stats
-            models_used = set(r.llm_model for r in self.current_question_records if r.llm_model)
-            for model in models_used:
-                model_records = [r for r in self.current_question_records if r.llm_model == model]
-                question_metrics["llm"]["by_model"][model] = {
-                    "calls": len(model_records),
-                    "prompt_tokens": sum(r.llm_prompt_tokens for r in model_records),
-                    "completion_tokens": sum(r.llm_completion_tokens for r in model_records),
-                    "total_latency_ms": round(sum(r.llm_total_latency_ms for r in model_records), 2),
-                    "cache_read_tokens": sum(r.cache_read_tokens for r in model_records),
-                    "cache_write_tokens": sum(r.cache_write_tokens for r in model_records)
-                }
+        models_used = set(r.llm_model for r in local_records if r.llm_model)
+        for model in models_used:
+            model_records = [r for r in local_records if r.llm_model == model]
+            question_metrics["llm"]["by_model"][model] = {
+                "calls": len(model_records),
+                "prompt_tokens": sum(r.llm_prompt_tokens for r in model_records),
+                "completion_tokens": sum(r.llm_completion_tokens for r in model_records),
+                "total_latency_ms": round(sum(r.llm_total_latency_ms for r in model_records), 2),
+                "cache_read_tokens": sum(r.cache_read_tokens for r in model_records),
+                "cache_write_tokens": sum(r.cache_write_tokens for r in model_records)
+            }
             
             # Add cache stats to question metrics
-            question_metrics["cache"] = {
-                "cache_read_tokens": sum(r.cache_read_tokens for r in self.current_question_records),
-                "cache_write_tokens": sum(r.cache_write_tokens for r in self.current_question_records),
-                "fresh_input_tokens": sum(r.fresh_input_tokens for r in self.current_question_records)
-            }
+        question_metrics["cache"] = {
+            "cache_read_tokens": sum(r.cache_read_tokens for r in local_records),
+            "cache_write_tokens": sum(r.cache_write_tokens for r in local_records),
+            "fresh_input_tokens": sum(r.fresh_input_tokens for r in local_records)
+        }
             
             # Add tool response count
-            question_metrics["tool_response"] = {
-                "total_tool_calls": sum(1 for r in self.current_question_records if r.tool_name),
-                "total_tool_result_chars": sum(r.tool_result_length for r in self.current_question_records)
-            }
-            
+        question_metrics["tool_response"] = {
+            "total_tool_calls": sum(1 for r in local_records if r.tool_name),
+            "total_tool_result_chars": sum(r.tool_result_length for r in local_records)
+        }
+
+        with self._lock:
+            self.iteration_counts.append(turns)
             self.all_question_metrics.append(question_metrics)
-            
-            # Reset current question
-            self.current_question = None
-            self.current_question_records = []
-            
-            return question_metrics
+
+        # Reset current thread-local question state.
+        self.current_question = None
+        self.current_question_records = []
+
+        return question_metrics
     
     def get_summary(self) -> Dict:
         """Get overall summary statistics."""
@@ -466,6 +478,24 @@ class MetricsCollector:
             total_questions = len(self.all_question_metrics)
             total_turns = sum(m["total_turns"] for m in self.all_question_metrics)
             questions_with_answer = sum(1 for m in self.all_question_metrics if m.get("final_answer_found", False))
+
+            evaluated_questions = [
+                m for m in self.all_question_metrics
+                if isinstance(m.get("evaluation"), dict) and m["evaluation"].get("evaluated", False)
+            ]
+            evaluated_count = len(evaluated_questions)
+            correct_count = sum(1 for m in evaluated_questions if m["evaluation"].get("is_correct") is True)
+            incorrect_count = sum(1 for m in evaluated_questions if m["evaluation"].get("is_correct") is False)
+            avg_score = 0.0
+            if evaluated_count > 0:
+                score_sum = 0.0
+                score_count = 0
+                for m in evaluated_questions:
+                    score = m["evaluation"].get("score")
+                    if isinstance(score, (int, float)):
+                        score_sum += float(score)
+                        score_count += 1
+                avg_score = (score_sum / score_count) if score_count > 0 else 0.0
             
             # Aggregate LLM stats
             total_llm_calls_all = sum(m["llm"]["total_calls"] for m in self.all_question_metrics)
@@ -509,6 +539,15 @@ class MetricsCollector:
                 "total_turns": total_turns,
                 "avg_turns_per_question": round(total_turns / total_questions, 2) if total_questions > 0 else 0,
                 "answer_success_rate": f"{(questions_with_answer / total_questions * 100):.2f}%" if total_questions > 0 else "0%",
+                "evaluation": {
+                    "evaluated_questions": evaluated_count,
+                    "not_evaluated_questions": max(0, total_questions - evaluated_count),
+                    "correct_count": correct_count,
+                    "incorrect_count": incorrect_count,
+                    "accuracy": round((correct_count / evaluated_count * 100), 2) if evaluated_count > 0 else 0.0,
+                    "accuracy_str": f"{(correct_count / evaluated_count * 100):.2f}%" if evaluated_count > 0 else "N/A",
+                    "avg_score": round(avg_score, 4)
+                },
                 "llm": {
                     "total_calls": total_llm_calls_all,
                     "successful_calls": successful_llm_calls_all,
