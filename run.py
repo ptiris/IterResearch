@@ -165,14 +165,65 @@ TOOLS = [
     PYTHON_INTERPRETER_TOOL
 ]
 
+ALL_TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS + [ALIYUN_IQS_TOOL]}
+TOOL_NAME_ALIASES = {
+    "google": "google_search",
+    "google_search": "google_search",
+    "baidu": "baidu_search",
+    "baidu_search": "baidu_search",
+    "aliyun": "aliyun_iqs_search",
+    "aliyun_iqs": "aliyun_iqs_search",
+    "aliyun_iqs_search": "aliyun_iqs_search",
+    "scholar": "google_scholar",
+    "google_scholar": "google_scholar",
+    "visit": "Visit",
+    "python": "PythonInterpreter",
+    "python_interpreter": "PythonInterpreter",
+    "pythoninterpreter": "PythonInterpreter",
+    "PythonInterpreter": "PythonInterpreter"
+}
+
 
 # =============================================================================
 # Global Variables
 # =============================================================================
 
 
+def _parse_tools_arg(tools_arg: str) -> list:
+    """Parse --tools CSV argument into canonical tool names."""
+    if not tools_arg:
+        return []
+
+    raw_items = [item.strip() for item in tools_arg.split(',') if item.strip()]
+    if not raw_items:
+        return []
+
+    resolved = []
+    unknown = []
+    for item in raw_items:
+        key = item.replace('-', '_')
+        canonical = TOOL_NAME_ALIASES.get(key) or TOOL_NAME_ALIASES.get(key.lower())
+        if not canonical:
+            unknown.append(item)
+            continue
+        if canonical not in resolved:
+            resolved.append(canonical)
+
+    if unknown:
+        valid_names = sorted(set(TOOL_NAME_ALIASES.keys()))
+        raise ValueError(
+            f"Unknown tool(s): {', '.join(unknown)}. "
+            f"Valid values include: {', '.join(valid_names)}"
+        )
+
+    return resolved
+
+
 def get_tools_for_engine(search_engine: str) -> list:
-    """Get filtered TOOLS list based on selected search engine."""
+    """Get filtered TOOLS list based on selected search engine or --tools override."""
+    if ACTIVE_TOOL_NAMES:
+        return [ALL_TOOLS_BY_NAME[name] for name in ACTIVE_TOOL_NAMES]
+
     base_tools = [VISIT_TOOL, PYTHON_INTERPRETER_TOOL]
     
     if search_engine == "google":
@@ -201,6 +252,7 @@ scholar_engine = Scholar()
 visit_tool = Visit()
 
 SEARCH_ENGINE = "google"
+ACTIVE_TOOL_NAMES = None
 RESEARCH_MODEL = "qwen-flash"
 SUMMARY_LLM_URL_CONFIG = SUMMARY_LLM_URL
 SUMMARY_MODEL = "qwen-flash"
@@ -798,8 +850,8 @@ def evaluate_answer_with_llm(
         ],
         "temperature": 0
     }
-    if provider == "deepseek":
-        payload["response_format"] = {"type": "json_object"}
+    # if provider == "deepseek":
+        # payload["response_format"] = {"type": "json_object"}
 
     try:
         resp = requests.post(endpoint, headers=headers, json=payload, timeout=120)
@@ -916,7 +968,7 @@ def call_llm(
             payload = {
                 "model": model_name,
                 "messages": request_messages,
-                "temperature": 0.2,
+                "temperature": 0.4,
                 "top_p": 0.80,
                 "presence_penalty": 1.5
             }
@@ -1052,6 +1104,19 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
     tool_start_time = time.time()
     metrics = get_metrics_collector()
     effective_calls = _get_effective_tool_calls(tool_name, arguments)
+
+    enabled_tools = {tool["name"] for tool in get_tools_for_engine(SEARCH_ENGINE)}
+    if tool_name not in enabled_tools:
+        msg = f"Tool '{tool_name}' is not enabled in current configuration. Enabled tools: {sorted(enabled_tools)}"
+        metrics.record_tool_call(
+            tool_name=tool_name,
+            args=arguments,
+            latency_ms=(time.time() - tool_start_time) * 1000,
+            success=False,
+            error="ToolNotEnabled",
+            effective_calls=effective_calls
+        )
+        return msg, []
     
     try:
         if tool_name == 'google_search':
@@ -1527,13 +1592,19 @@ def agentic_loop(
 # =============================================================================
 def main(args):
     """Main entry point."""
-    global SEARCH_ENGINE, RESEARCH_MODEL, SUMMARY_LLM_URL_CONFIG, SUMMARY_MODEL
+    global SEARCH_ENGINE, ACTIVE_TOOL_NAMES, RESEARCH_MODEL, SUMMARY_LLM_URL_CONFIG, SUMMARY_MODEL
     global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
     global visit_tool, DISABLE_GOOGLE_SCHOLAR
     global EVALUATOR_ENABLED, EVALUATOR_LLM_URL_CONFIG, EVALUATOR_MODEL
     global MAX_COMPLETION_TOKENS_CONFIG
     
     SEARCH_ENGINE = args.search_engine
+    try:
+        ACTIVE_TOOL_NAMES = _parse_tools_arg(args.tools)
+    except ValueError as e:
+        print(f"Invalid --tools value: {e}")
+        sys.exit(2)
+
     DISABLE_GOOGLE_SCHOLAR = args.disable_google_scholar
     RESEARCH_MODEL = args.research_model
     SUMMARY_LLM_URL_CONFIG = args.summary_llm_url
@@ -1555,6 +1626,10 @@ def main(args):
     )
     
     print(f"Using search engine: {SEARCH_ENGINE}")
+    if ACTIVE_TOOL_NAMES:
+        print(f"Using tool override (--tools): {ACTIVE_TOOL_NAMES}")
+    else:
+        print("Using default tool list from --search_engine")
     print(f"Using research model: {RESEARCH_MODEL}")
     print(f"Using summary LLM URL: {SUMMARY_LLM_URL_CONFIG}")
     print(f"Using summary model: {SUMMARY_MODEL}")
@@ -1907,6 +1982,16 @@ if __name__ == "__main__":
         default=None,
         choices=["google", "baidu","aliyun"],
         help="Search engine to use: 'google' for Google SerpAPI, 'baidu' for Baidu Qianfan"
+    )
+    parser.add_argument(
+        "--tools",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated tool list override. "
+            "Examples: google,baidu,aliyun,python_interpreter,visit,google_scholar. "
+            "When set, this overrides --search_engine tool defaults."
+        )
     )
     parser.add_argument(
         "--summary_llm_url",
