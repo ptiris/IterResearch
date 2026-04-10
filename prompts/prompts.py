@@ -132,6 +132,7 @@ You MUST output this section enclosed with <tool_call></tool_call> tags!
 - Start with <report>...</report> section
 - Then choose: <answer>...</answer> if sufficient info, OR <tool_call>...</tool_call> if need more action
 - Never output both answer and tool_call tags in same response
+- The Report section should be limited to 6k tokens and tool call parameters should never be truncated.
 
 ## Input
 - Current Date: {date_to_use}
