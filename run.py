@@ -844,6 +844,7 @@ def evaluate_answer_with_llm(
     model: str
 ) -> dict:
     """Evaluate predicted answer against reference answer using an LLM judge."""
+    global CURRENT_API_KEY
     if not predicted_answer.strip():
         return {
             "evaluated": False,
@@ -869,7 +870,9 @@ def evaluate_answer_with_llm(
     endpoint = _normalize_llm_endpoint(llm_url)
 
     headers = {'Content-Type': 'application/json'}
-    if OPENAI_API_KEY:
+    if CURRENT_API_KEY:
+        headers['Authorization'] = f'Bearer {CURRENT_API_KEY}'
+    elif OPENAI_API_KEY:
         headers['Authorization'] = f'Bearer {OPENAI_API_KEY}'
 
     judge_instruction = (
