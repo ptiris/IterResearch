@@ -9,13 +9,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =============================================================================
-# LLM Configuration
+# LLM Configuration (Provider-based)
 # =============================================================================
-# Main LLM endpoint for agent reasoning
-LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
+# Aliyun LLM configuration
+ALIYUN_LLM_URL = os.getenv("ALIYUN_LLM_URL", "")
+ALIYUN_API_KEY = os.getenv("ALIYUN_API_KEY", "")
+
+# DeepSeek LLM configuration
+DEEPSEEK_LLM_URL = os.getenv("DEEPSEEK_LLM_URL", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+# OpenAI API Key (used by all providers, prioritized by provider-specific keys if set)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Summary LLM endpoint for webpage content extraction
+# Legacy support for backward compatibility
+LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
 SUMMARY_LLM_URL = os.getenv("SUMMARY_LLM_URL", "http://127.0.0.1:10086/v1/chat/completions")
 SUMMARY_LLM_AUTH = os.getenv("SUMMARY_LLM_AUTH", "")
 

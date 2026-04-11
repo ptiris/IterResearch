@@ -125,6 +125,8 @@ class MetricsCollector:
         # Per-question data
         self.current_question = None
         self.current_question_records = []
+        self.current_question_tool_calls = []
+        self.current_question_llm_failures = []
         
         # Aggregated stats
         self.all_question_metrics: List[Dict] = []
@@ -182,6 +184,30 @@ class MetricsCollector:
     @current_question_records.setter
     def current_question_records(self, value: List[StepRecord]):
         self._thread_local.current_question_records = value
+
+    @property
+    def current_question_tool_calls(self) -> List[Dict[str, Any]]:
+        tool_calls = getattr(self._thread_local, "current_question_tool_calls", None)
+        if tool_calls is None:
+            tool_calls = []
+            self._thread_local.current_question_tool_calls = tool_calls
+        return tool_calls
+
+    @current_question_tool_calls.setter
+    def current_question_tool_calls(self, value: List[Dict[str, Any]]):
+        self._thread_local.current_question_tool_calls = value
+
+    @property
+    def current_question_llm_failures(self) -> List[Dict[str, Any]]:
+        llm_failures = getattr(self._thread_local, "current_question_llm_failures", None)
+        if llm_failures is None:
+            llm_failures = []
+            self._thread_local.current_question_llm_failures = llm_failures
+        return llm_failures
+
+    @current_question_llm_failures.setter
+    def current_question_llm_failures(self, value: List[Dict[str, Any]]):
+        self._thread_local.current_question_llm_failures = value
     
     def _get_or_create_tool_stats(self, tool_name: str) -> ToolStats:
         """Get or create tool stats for a tool."""
@@ -194,6 +220,18 @@ class MetricsCollector:
         # Thread-local context does not need global locking.
         self.current_question = question
         self.current_question_records = []
+        self.current_question_tool_calls = []
+        self.current_question_llm_failures = []
+
+    def record_llm_failure(self, turn: int, model: str, error_type: str, error_msg: str):
+        """Record one LLM failure event (including retries)."""
+        self.current_question_llm_failures.append({
+            "turn": turn,
+            "model": model,
+            "error_type": error_type,
+            "error_msg": error_msg,
+            "timestamp": time.time()
+        })
     
     def start_global_timer(self):
         """Start global timer for entire run."""
@@ -315,6 +353,18 @@ class MetricsCollector:
             current_record.tool_latency_ms = latency_ms
             current_record.tool_success = success
             current_record.tool_error = error
+
+        self.current_question_tool_calls.append({
+            "turn": current_record.turn if current_record is not None else -1,
+            "tool_name": tool_name,
+            "args": args,
+            "result": current_record.tool_result if current_record is not None else None,
+            "result_length": current_record.tool_result_length if current_record is not None else 0,
+            "latency_ms": round(latency_ms, 2),
+            "success": success,
+            "error": error,
+            "effective_calls": effective_calls
+        })
     
     def start_iteration(self, turn: int, query: str, action: str):
         """Start a new iteration/step."""
@@ -339,6 +389,10 @@ class MetricsCollector:
             record = self.current_question_records[-1]
             record.tool_result = result[:1000] if result else ""
             record.tool_result_length = result_length
+        if self.current_question_tool_calls:
+            call_record = self.current_question_tool_calls[-1]
+            call_record["result"] = result
+            call_record["result_length"] = result_length
     
     def end_iteration(self):
         """End current iteration and calculate total latency."""
@@ -356,15 +410,17 @@ class MetricsCollector:
     ) -> Dict:
         """End tracking for current question and return metrics."""
         local_records = list(self.current_question_records)
+        local_tool_calls = list(self.current_question_tool_calls)
+        local_llm_failures = list(self.current_question_llm_failures)
         if not local_records:
             return {}
 
         turns = len(local_records)
             
             # Calculate question-level stats
-        total_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0)
-        successful_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0 and r.llm_success)
-        failed_llm_calls = sum(1 for r in local_records if r.llm_prompt_tokens > 0 and not r.llm_success)
+        total_llm_calls = sum(1 for r in local_records if r.llm_model)
+        successful_llm_calls = sum(1 for r in local_records if r.llm_model and r.llm_success)
+        failed_llm_calls = sum(1 for r in local_records if r.llm_model and not r.llm_success)
         total_prompt_tokens = sum(r.llm_prompt_tokens for r in local_records)
         total_completion_tokens = sum(r.llm_completion_tokens for r in local_records)
         total_llm_latency = sum(r.llm_total_latency_ms for r in local_records)
@@ -424,6 +480,8 @@ class MetricsCollector:
                 "by_model": {}
             },
             "tool_usage": tool_usage,
+            "tool_call_records": local_tool_calls,
+            "llm_failure_records": local_llm_failures,
             "total_tool_latency_ms": round(total_tool_latency, 2),
             "iteration_latencies": iteration_latencies,
             "latency_breakdown": {
@@ -466,6 +524,8 @@ class MetricsCollector:
         # Reset current thread-local question state.
         self.current_question = None
         self.current_question_records = []
+        self.current_question_tool_calls = []
+        self.current_question_llm_failures = []
 
         return question_metrics
     

@@ -188,3 +188,50 @@ If you use IterResearch in your research, please cite:
 - **Email**: gx.chen.chn@gmail.com
 
 We will do our best to answer your questions. However, due to company policy restrictions that prevent us from open-sourcing the production version, there may be some questions we cannot fully address. We appreciate your understanding.
+
+# Supplement
+
+增加的参数说明:
+
+-- `tools` 指定一个 tools list ，例如 `--tools google_search google_scholar visit python_interpreter`，如果不指定，则默认使用全部工具。
+-- `provider` 指定使用LLM提供商，例如`--provider aliyun`
+
+整体的使用示例:
+
+```bash
+python3 run.py \                                     ─╯
+--input_fp data/bc-zn3.jsonl \
+--output_path output/ \
+--max_workers 1 \
+--max_format_retries 5 \
+--max_turn 25 \
+--research_model deepseek-v3.2 \
+--summary_model deepseek-v3.2 \
+--evaluator_model deepseek-v3.2 \
+--tools python_interpreter,google,google_scholar \
+--provider aliyun
+```
+
+注意： 
+1. 如果卡在了提示 No pytorch found , only tokenizer will be used. 这一步，有可能是和 hf 的连接问题，可以 ` export HF_ENDPOINT=https://hf-mirror.com` 来解决。
+
+2. .env中需要参数的格式，由于新增了 provider 选择，有一些变化，例如：
+
+```
+# Main LLM endpoint for agent reasoning (required)
+export ALIYUN_LLM_URL="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+export DEEPSEEK_LLM_URL="https://api.deepseek.com/chat/completions"
+
+# Main LLM Configuration (DS/DashScope)
+export ALIYUN_API_KEY="sk-xxx"
+export DEEPSEEK_API_KEY="sk-xxx"
+```
+
+不需要指定 LLM_URL 和 SUMMARY_LLM_URL 了，如果有可能会覆盖。
+
+3. 运行 Python Sandbox 可以安装 uvicorn 和 fastapi 之后通过以下命令启动：
+
+```bash
+cd sandbox
+uvicorn main:app --host 0.0.0.0 --port 8080
+```

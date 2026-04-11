@@ -31,7 +31,11 @@ from config import (
     MAX_WEBPAGE_TOKENS,
     TOKENIZER_PATH,
     SUMMARY_LLM_URL,
-    SUMMARY_LLM_AUTH
+    SUMMARY_LLM_AUTH,
+    ALIYUN_LLM_URL,
+    ALIYUN_API_KEY,
+    DEEPSEEK_LLM_URL,
+    DEEPSEEK_API_KEY
 )
 from prompts import (
     initial_instruction_prompt,
@@ -254,7 +258,8 @@ visit_tool = Visit()
 SEARCH_ENGINE = "google"
 ACTIVE_TOOL_NAMES = None
 RESEARCH_MODEL = "qwen-flash"
-SUMMARY_LLM_URL_CONFIG = SUMMARY_LLM_URL
+LLM_URL_CONFIG = LLM_URL  # Main LLM URL for all purposes
+SUMMARY_LLM_URL_CONFIG = SUMMARY_LLM_URL  # Kept for backward compatibility
 SUMMARY_MODEL = "qwen-flash"
 TOKENIZER_PATH_CONFIG = TOKENIZER_PATH
 MAX_OBSERVATION_TOKENS_CONFIG = MAX_OBSERVATION_TOKENS
@@ -264,6 +269,7 @@ EVALUATOR_ENABLED = True
 EVALUATOR_LLM_URL_CONFIG = LLM_URL
 EVALUATOR_MODEL = "qwen-flash"
 MAX_COMPLETION_TOKENS_CONFIG = 4096
+CURRENT_API_KEY = None  # API key for current provider
 
 # Statistics
 failed_call = 0
@@ -272,6 +278,43 @@ CALL_COUNTER_LOCK = threading.Lock()
 
 # Tokenizer for observation length control
 _tokenizer = None
+
+def configure_provider(provider: str) -> tuple:
+    """
+    Load LLM configuration based on provider.
+    
+    Args:
+        provider: Provider name ('aliyun', 'deepseek', or 'default')
+        
+    Returns:
+        Tuple of (llm_url, api_key) for the provider
+    """
+    global LLM_URL_CONFIG, EVALUATOR_LLM_URL_CONFIG, CURRENT_API_KEY
+    
+    provider = provider.lower() if provider else "default"
+    
+    if provider == "aliyun":
+        if not ALIYUN_LLM_URL:
+            raise ValueError("ALIYUN_LLM_URL not configured in environment")
+        llm_url = ALIYUN_LLM_URL
+        api_key = ALIYUN_API_KEY
+        print(f"[CONFIG] Using Aliyun provider: {llm_url}")
+    elif provider == "deepseek":
+        if not DEEPSEEK_LLM_URL:
+            raise ValueError("DEEPSEEK_LLM_URL not configured in environment")
+        llm_url = DEEPSEEK_LLM_URL
+        api_key = DEEPSEEK_API_KEY
+        print(f"[CONFIG] Using DeepSeek provider: {llm_url}")
+    else:  # default or other
+        llm_url = LLM_URL
+        api_key = OPENAI_API_KEY
+        print(f"[CONFIG] Using default provider: {llm_url}")
+    
+    LLM_URL_CONFIG = llm_url
+    EVALUATOR_LLM_URL_CONFIG = llm_url
+    CURRENT_API_KEY = api_key or OPENAI_API_KEY  # Fallback to OPENAI_API_KEY if provider-specific key is empty
+    
+    return llm_url, CURRENT_API_KEY
 
 def get_tokenizer():
     """Lazy load tokenizer."""
@@ -922,7 +965,7 @@ def call_llm(
     messages: list,
     check_format: bool = False,
     max_retries: int = MAX_FORMAT_RETRIES,
-    llm_url: str = LLM_URL,
+    llm_url: str = None,
     model: str = None,
     turn: int = -1
 ) -> EasyDict:
@@ -933,7 +976,7 @@ def call_llm(
         messages: List of chat messages.
         check_format: Whether to validate response format.
         max_retries: Maximum retries for format validation.
-        llm_url: URL of the LLM endpoint.
+        llm_url: URL of the LLM endpoint. If None, uses LLM_URL_CONFIG (current provider).
         model: Model name to use. Falls back to RESEARCH_MODEL global.
         turn: Current iteration turn number for metrics tracking.
         
@@ -942,8 +985,14 @@ def call_llm(
     """
     global total_call, failed_call, RESEARCH_MODEL
     
+    # Use configured provider URL if not explicitly specified
+    if llm_url is None:
+        llm_url = LLM_URL_CONFIG
+    
     headers = {'Content-Type': 'application/json'}
-    if OPENAI_API_KEY:
+    if CURRENT_API_KEY:
+        headers['Authorization'] = f'Bearer {CURRENT_API_KEY}'
+    elif OPENAI_API_KEY:
         headers['Authorization'] = f'Bearer {OPENAI_API_KEY}'
     
     response = None
@@ -984,6 +1033,12 @@ def call_llm(
             if resp.status_code != 200:
                 print(f"LLM Error: {resp.status_code}: {resp.text}")
                 metrics = get_metrics_collector()
+                metrics.record_llm_failure(
+                    turn=turn,
+                    model=model_name,
+                    error_type=f"HTTP_{resp.status_code}",
+                    error_msg=resp.text
+                )
                 metrics.record_llm_call(
                     model=model_name,
                     prompt_tokens=0,
@@ -1035,12 +1090,19 @@ def call_llm(
             )
             
             if not llm_success:
-                raise Exception("Format check failed")
+                raise Exception(f"FormatCheckFailed: {reason}")
             
             return response
             
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
+            metrics = get_metrics_collector()
+            metrics.record_llm_failure(
+                turn=turn,
+                model=model_name,
+                error_type=type(e).__name__,
+                error_msg=str(e)
+            )
             time.sleep(2)
     
     return response
@@ -1596,7 +1658,15 @@ def main(args):
     global TOKENIZER_PATH_CONFIG, MAX_OBSERVATION_TOKENS_CONFIG, MAX_WEBPAGE_TOKENS_CONFIG
     global visit_tool, DISABLE_GOOGLE_SCHOLAR
     global EVALUATOR_ENABLED, EVALUATOR_LLM_URL_CONFIG, EVALUATOR_MODEL
-    global MAX_COMPLETION_TOKENS_CONFIG
+    global MAX_COMPLETION_TOKENS_CONFIG, LLM_URL_CONFIG, CURRENT_API_KEY
+    
+    # Resolve runtime LLM endpoint: provider takes precedence; otherwise use --llm_url.
+    if hasattr(args, 'provider') and args.provider:
+        configure_provider(args.provider)
+    else:
+        LLM_URL_CONFIG = args.llm_url
+        EVALUATOR_LLM_URL_CONFIG = args.llm_url
+        CURRENT_API_KEY = OPENAI_API_KEY
     
     SEARCH_ENGINE = args.search_engine
     try:
@@ -1607,19 +1677,19 @@ def main(args):
 
     DISABLE_GOOGLE_SCHOLAR = args.disable_google_scholar
     RESEARCH_MODEL = args.research_model
-    SUMMARY_LLM_URL_CONFIG = args.summary_llm_url
+    SUMMARY_LLM_URL_CONFIG = LLM_URL_CONFIG  # Use unified LLM URL from provider
     SUMMARY_MODEL = args.summary_model
     TOKENIZER_PATH_CONFIG = args.tokenizer_path
     MAX_OBSERVATION_TOKENS_CONFIG = args.max_observation_tokens
     MAX_WEBPAGE_TOKENS_CONFIG = args.max_webpage_tokens
     MAX_COMPLETION_TOKENS_CONFIG = args.max_completion_tokens
     EVALUATOR_ENABLED = not args.disable_evaluator
-    EVALUATOR_LLM_URL_CONFIG = args.evaluator_llm_url
+    EVALUATOR_LLM_URL_CONFIG = LLM_URL_CONFIG  # Use unified LLM URL from provider
     EVALUATOR_MODEL = args.evaluator_model
     
     visit_tool = Visit(
-        summary_llm_url=args.summary_llm_url,
-        summary_llm_auth=SUMMARY_LLM_AUTH,
+        summary_llm_url=LLM_URL_CONFIG,  # Use unified LLM URL from provider
+        summary_llm_auth=CURRENT_API_KEY or SUMMARY_LLM_AUTH,
         summary_model=args.summary_model,
         max_webpage_tokens=args.max_webpage_tokens,
         tokenizer_path=args.tokenizer_path
@@ -1678,7 +1748,7 @@ def main(args):
                 data=data,
                 max_format_retries=args.max_format_retries,
                 max_turn=args.max_turn,
-                llm_url=args.llm_url,
+                llm_url=LLM_URL_CONFIG,
                 model=args.research_model
             )
             for data in all_data
@@ -1965,6 +2035,13 @@ if __name__ == "__main__":
         help="URL of the LLM endpoint"
     )
     parser.add_argument(
+        "--provider",
+        type=str,
+        default=None,
+        choices=["aliyun", "deepseek", "default"],
+        help="LLM provider to use: 'aliyun', 'deepseek', or 'default'. Overrides --llm_url when set."
+    )
+    parser.add_argument(
         "--research_model",
         type=str,
         default="qwen-flash",
@@ -1992,13 +2069,6 @@ if __name__ == "__main__":
             "Examples: google,baidu,aliyun,python_interpreter,visit,google_scholar. "
             "When set, this overrides --search_engine tool defaults."
         )
-    )
-    parser.add_argument(
-        "--summary_llm_url",
-        type=str,
-        default=SUMMARY_LLM_URL,
-
-        help="URL of the summary LLM endpoint"
     )
     parser.add_argument(
         "--tokenizer_path",
@@ -2039,12 +2109,6 @@ if __name__ == "__main__":
         "--disable_evaluator",
         action="store_true",
         help="Disable LLM-based final answer evaluator"
-    )
-    parser.add_argument(
-        "--evaluator_llm_url",
-        type=str,
-        default=LLM_URL,
-        help="URL of the evaluator LLM endpoint"
     )
     parser.add_argument(
         "--evaluator_model",
