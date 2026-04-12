@@ -184,12 +184,12 @@ TOOL_PRICING = {
     },
     "google_search": {
         "unit": "calls",
-        "price_per_1000_calls": 0.0,
+        "price_per_1000_calls": 198.0,
         "billing_calls_key": "effective_calls",
     },
     "google_scholar": {
         "unit": "calls",
-        "price_per_1000_calls": 0.0,
+        "price_per_1000_calls": 198.0,
         "billing_calls_key": "effective_calls",
     },
     "baidu_search": {

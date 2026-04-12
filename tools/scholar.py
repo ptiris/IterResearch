@@ -184,7 +184,19 @@ class Scholar:
         self.total_latency_ms += (time.time() - start_time) * 1000
         return f"No results found for '{query}'. Try with a more general query."
 
-    def call(self, params: Union[str, dict], **kwargs) -> str:
+    def _is_failed_result(self, result: str) -> bool:
+        """Check whether a single-query scholar result indicates failure."""
+        if not isinstance(result, str):
+            return True
+        failure_indicators = [
+            "Google Scholar search failed",
+            "No results found",
+            "[Google Scholar] Error",
+            "Invalid request",
+        ]
+        return any(result.startswith(indicator) or indicator in result for indicator in failure_indicators)
+
+    def call(self, params: Union[str, dict], **kwargs) -> Union[str, List[dict]]:
         """
         Execute Google Scholar search with given parameters.
         
@@ -214,7 +226,16 @@ class Scholar:
         elif isinstance(query, list):
             with ThreadPoolExecutor(max_workers=3) as executor:
                 responses = list(executor.map(self._search_single, query))
-            return "\n=======\n".join(responses)
+            structured_results = []
+            for q, single_result in zip(query, responses):
+                is_failed = self._is_failed_result(single_result)
+                structured_results.append({
+                    "query": q,
+                    "success": not is_failed,
+                    "result": single_result,
+                    "error": single_result if is_failed else ""
+                })
+            return structured_results
         else:
             return "[Google Scholar] Invalid query format: must be string or array of strings"
 

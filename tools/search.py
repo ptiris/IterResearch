@@ -189,7 +189,19 @@ class Search:
         self.total_latency_ms += (time.time() - start_time) * 1000
         return f"No results found for '{query}'. Try with a more general query."
     
-    def call(self, params: Union[str, dict], **kwargs) -> str:
+    def _is_failed_result(self, result: str) -> bool:
+        """Check whether a single-query search result indicates failure."""
+        if not isinstance(result, str):
+            return True
+        failure_indicators = [
+            "Search failed",
+            "No results found",
+            "[Search] Error",
+            "Invalid request",
+        ]
+        return any(result.startswith(indicator) or indicator in result for indicator in failure_indicators)
+
+    def call(self, params: Union[str, dict], **kwargs) -> Union[str, List[dict]]:
         """
         Execute search with given parameters.
         
@@ -218,8 +230,17 @@ class Search:
         if isinstance(query, str):
             return self._search_single(query)
         elif isinstance(query, list):
-            responses = [self._search_single(q) for q in query]
-            return "\n=======\n".join(responses)
+            structured_results = []
+            for q in query:
+                single_result = self._search_single(q)
+                is_failed = self._is_failed_result(single_result)
+                structured_results.append({
+                    "query": q,
+                    "success": not is_failed,
+                    "result": single_result,
+                    "error": single_result if is_failed else ""
+                })
+            return structured_results
         else:
             return "[Search] Invalid query format: must be string or array of strings"
 

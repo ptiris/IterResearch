@@ -81,9 +81,9 @@ class ToolStats:
     
     @property
     def success_rate(self) -> str:
-        if self.total_calls == 0:
+        if self.effective_calls == 0:
             return "0%"
-        return f"{(self.successful_calls / self.total_calls * 100):.2f}%"
+        return f"{(self.successful_calls / self.effective_calls * 100):.2f}%"
     
     @property
     def avg_latency_ms(self) -> float:
@@ -328,7 +328,10 @@ class MetricsCollector:
         cost_estimate: float = 0.0,
         input_tokens: int = 0,
         output_tokens: int = 0,
-        effective_calls: int = 1
+        effective_calls: int = 1,
+        successful_calls: Optional[int] = None,
+        failed_calls: Optional[int] = None,
+        failed_queries: Optional[List[Dict[str, Any]]] = None
     ):
         """Record a tool call."""
         current_record = self.current_question_records[-1] if self.current_question_records else None
@@ -341,13 +344,23 @@ class MetricsCollector:
             stats.total_cost_estimate += cost_estimate
             stats.total_input_tokens += input_tokens
             stats.total_output_tokens += output_tokens
+
+            succ_calls = successful_calls
+            fail_calls = failed_calls
+            if succ_calls is None or fail_calls is None:
+                if success:
+                    succ_calls = max(0, effective_calls)
+                    fail_calls = 0
+                else:
+                    succ_calls = 0
+                    fail_calls = max(0, effective_calls)
             
-            if success:
-                stats.successful_calls += 1
-            else:
-                stats.failed_calls += 1
+            stats.successful_calls += max(0, succ_calls)
+            stats.failed_calls += max(0, fail_calls)
+
+            if not success:
                 if error:
-                    stats.error_types[error] += 1
+                    stats.error_types[error] += max(1, fail_calls)
 
         if current_record is not None:
             current_record.tool_latency_ms = latency_ms
@@ -363,7 +376,10 @@ class MetricsCollector:
             "latency_ms": round(latency_ms, 2),
             "success": success,
             "error": error,
-            "effective_calls": effective_calls
+            "effective_calls": effective_calls,
+            "successful_calls": succ_calls,
+            "failed_calls": fail_calls,
+            "failed_queries": failed_queries or []
         })
     
     def start_iteration(self, turn: int, query: str, action: str):

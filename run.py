@@ -1000,6 +1000,17 @@ def call_llm(
     
     response = None
     call_start_time = time.time()
+
+    retry_format_guard = (
+        "FORMAT RETRY REMINDER (STRICT):\\n"
+        "- Output MUST include <report>...</report>.\\n"
+        "- Output MUST include exactly one of <tool_call>...</tool_call> OR <answer>...</answer>.\\n"
+        "- If using <tool_call>...</tool_call>, content inside it MUST be valid JSON object exactly like: "
+        "{\"name\": \"tool_name\", \"arguments\": {...}}\\n"
+        "- Do NOT output XML-style nested tool fields like <name>...</name> or <arguments>...</arguments>.\\n"
+        "- Tag pairs must be complete and not truncated.\\n"
+        "- Output only the required tagged content, no extra wrappers."
+    )
     
     model_name = model or RESEARCH_MODEL
     provider = _detect_provider_from_url(llm_url)
@@ -1009,13 +1020,16 @@ def call_llm(
     for attempt in range(max_retries):
         try:
             request_messages = messages
+            if check_format and attempt > 0:
+                request_messages = [{"role": "system", "content": retry_format_guard}] + request_messages
+
             if provider == "deepseek" and check_format:
                 json_mode_guard = (
                     "You must output a valid JSON object only. "
                     "Put your full response that follows user-required tags (<report>/<tool_call>/<answer>) "
                     "inside key 'content'."
                 )
-                request_messages = [{"role": "system", "content": json_mode_guard}] + messages
+                request_messages = [{"role": "system", "content": json_mode_guard}] + request_messages
 
             payload = {
                 "model": model_name,
@@ -1125,6 +1139,8 @@ def _print_search_error(tool_name: str, error_type: str, error_msg: str):
 
 def _is_search_failure(result: str) -> bool:
     """Check if search result indicates a failure."""
+    if isinstance(result, list):
+        return any(isinstance(item, dict) and not item.get("success", False) for item in result)
     if not isinstance(result, str):
         return False
     failure_indicators = [
@@ -1152,6 +1168,38 @@ def _is_tool_failure(result: str, tool_name: str = None) -> bool:
     if tool_name == 'Visit':
         return result.startswith("[visit] Failed")
     return _is_search_failure(result)
+
+
+def _summarize_query_results(query_results):
+    """Summarize structured per-query results for metrics and observation text."""
+    if not isinstance(query_results, list):
+        return None
+
+    successful_calls = 0
+    failed_calls = 0
+    failed_queries = []
+    rendered_results = []
+
+    for item in query_results:
+        if not isinstance(item, dict):
+            continue
+        result_text = item.get("result", "")
+        rendered_results.append(result_text)
+        if item.get("success", False):
+            successful_calls += 1
+        else:
+            failed_calls += 1
+            failed_queries.append({
+                "query": item.get("query", ""),
+                "reason": item.get("error", result_text)
+            })
+
+    return {
+        "text": "\n=======\n".join(rendered_results),
+        "successful_calls": successful_calls,
+        "failed_calls": failed_calls,
+        "failed_queries": failed_queries
+    }
 
 
 def execute_tool(tool_name: str, arguments: dict) -> tuple:
@@ -1186,6 +1234,25 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
         if tool_name == 'google_search':
             result = google_search_engine.call(arguments)
             latency_ms = (time.time() - tool_start_time) * 1000
+            summary = _summarize_query_results(result)
+            if summary is not None:
+                final_text = summary["text"]
+                has_failure = summary["failed_calls"] > 0
+                if has_failure:
+                    _print_search_error(tool_name, "Search Error", json.dumps(summary["failed_queries"], ensure_ascii=False))
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=not has_failure,
+                    error="SearchFailed" if has_failure else None,
+                    effective_calls=effective_calls,
+                    successful_calls=summary["successful_calls"],
+                    failed_calls=summary["failed_calls"],
+                    failed_queries=summary["failed_queries"]
+                )
+                return final_text, []
+
             if _is_search_failure(result):
                 _print_search_error(tool_name, "Search Error", result)
                 metrics.record_tool_call(
@@ -1194,7 +1261,10 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     latency_ms=latency_ms,
                     success=False,
                     error="SearchFailed",
-                    effective_calls=effective_calls
+                    effective_calls=effective_calls,
+                    successful_calls=0,
+                    failed_calls=effective_calls,
+                    failed_queries=[{"query": arguments.get("query", ""), "reason": result}]
                 )
             else:
                 metrics.record_tool_call(
@@ -1202,7 +1272,10 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=True,
-                    effective_calls=effective_calls
+                    effective_calls=effective_calls,
+                    successful_calls=effective_calls,
+                    failed_calls=0,
+                    failed_queries=[]
                 )
             return result, []
         
@@ -1259,8 +1332,48 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
             else:
                 scholar_result = scholar_engine.call({"query": query})
                 search_result = google_search_engine.call(arguments)
-                result = f"{scholar_result}\n\n{search_result}"
+                if isinstance(scholar_result, list) and isinstance(search_result, list):
+                    combined = []
+                    for scholar_item, search_item in zip(scholar_result, search_result):
+                        query_text = scholar_item.get("query") or search_item.get("query")
+                        scholar_text = scholar_item.get("result", "")
+                        search_text = search_item.get("result", "")
+                        scholar_ok = scholar_item.get("success", False)
+                        search_ok = search_item.get("success", False)
+                        reason_parts = []
+                        if not scholar_ok:
+                            reason_parts.append(scholar_item.get("error", scholar_text))
+                        if not search_ok:
+                            reason_parts.append(search_item.get("error", search_text))
+                        combined.append({
+                            "query": query_text,
+                            "success": scholar_ok and search_ok,
+                            "result": f"{scholar_text}\n\n{search_text}",
+                            "error": " | ".join([part for part in reason_parts if part])
+                        })
+                    result = combined
+                else:
+                    result = f"{scholar_result}\n\n{search_result}"
             latency_ms = (time.time() - tool_start_time) * 1000
+            summary = _summarize_query_results(result)
+            if summary is not None:
+                final_text = summary["text"]
+                has_failure = summary["failed_calls"] > 0
+                if has_failure:
+                    _print_search_error(tool_name, "Search Error", json.dumps(summary["failed_queries"], ensure_ascii=False))
+                metrics.record_tool_call(
+                    tool_name=tool_name,
+                    args=arguments,
+                    latency_ms=latency_ms,
+                    success=not has_failure,
+                    error="SearchFailed" if has_failure else None,
+                    effective_calls=effective_calls,
+                    successful_calls=summary["successful_calls"],
+                    failed_calls=summary["failed_calls"],
+                    failed_queries=summary["failed_queries"]
+                )
+                return final_text, []
+
             if _is_search_failure(result):
                 _print_search_error(tool_name, "Search Error", result)
                 metrics.record_tool_call(
@@ -1269,7 +1382,10 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     latency_ms=latency_ms,
                     success=False,
                     error="SearchFailed",
-                    effective_calls=effective_calls
+                    effective_calls=effective_calls,
+                    successful_calls=0,
+                    failed_calls=effective_calls,
+                    failed_queries=[{"query": arguments.get("query", ""), "reason": result}]
                 )
             else:
                 metrics.record_tool_call(
@@ -1277,7 +1393,10 @@ def execute_tool(tool_name: str, arguments: dict) -> tuple:
                     args=arguments,
                     latency_ms=latency_ms,
                     success=True,
-                    effective_calls=effective_calls
+                    effective_calls=effective_calls,
+                    successful_calls=effective_calls,
+                    failed_calls=0,
+                    failed_queries=[]
                 )
             return result, []
         
