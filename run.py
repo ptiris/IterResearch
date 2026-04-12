@@ -1020,7 +1020,7 @@ def call_llm(
             payload = {
                 "model": model_name,
                 "messages": request_messages,
-                "temperature": 0.4,
+                "temperature": 0.2,
                 "top_p": 0.80,
                 "presence_penalty": 1.5
             }
@@ -1028,7 +1028,6 @@ def call_llm(
                 payload["max_tokens"] = MAX_COMPLETION_TOKENS_CONFIG
             if provider == "deepseek" and check_format:
                 payload["response_format"] = {"type": "json_object"}
-            # TODO : Add Deepseek Entrance for LLM calls and metrics collection
             llm_call_start = time.time()
             resp = requests.post(endpoint, headers=headers, json=payload, timeout=300)
             llm_call_latency_ms = (time.time() - llm_call_start) * 1000

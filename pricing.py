@@ -2,13 +2,23 @@
 Model Pricing Data for Cost Estimation.
 
 Pricing data sourced from LiteLLM model_prices_and_context_window.json.
-All prices are in USD per 1 million tokens.
+All prices should be configured in CNY per token.
 
 Note: For Chinese models like Qwen via DashScope, prices may vary.
       These are estimated values based on publicly available information.
 """
 
-USD_TO_CNY = 7.0
+MODEL_ALIASES = {
+    # DeepSeek public model aliases
+    "deepseek-v3": "deepseek-chat",
+    "deepseek-v3.1": "deepseek-chat",
+    "deepseek-v3.2": "deepseek-chat",
+    "deepseek-reasoner": "deepseek-chat",
+    # Common provider-prefixed names
+    "deepseek/deepseek-chat": "deepseek-chat",
+    "openai/gpt-4o": "gpt-4o",
+    "openai/gpt-4o-mini": "gpt-4o-mini",
+}
 
 MODEL_PRICING = {
     # Qwen Series (via DashScope/Aliyun)
@@ -115,9 +125,9 @@ MODEL_PRICING = {
     
     # DeepSeek Series
     "deepseek-chat": {
-        "input_cost_per_token": 0.0000001,
-        "output_cost_per_token": 0.00000028,
-        "cache_read_input_token_cost": 0.00000001,
+        "input_cost_per_token": 0.002 / 1000,
+        "output_cost_per_token": 0.003 / 1000,
+        "cache_read_input_token_cost": 0.002 / 5000,
         "cache_creation_input_token_cost": 0.00000014,
         "litellm_provider": "deepseek",
         "mode": "chat",
@@ -151,9 +161,64 @@ MODEL_PRICING = {
 }
 
 
+# Tool pricing in CNY, defaulting to the lowest ladder tier where applicable.
+# Source: Aliyun IQS billing docs (lowest tier / default tier assumptions).
+TOOL_PRICING = {
+    # UnifiedSearch Generic (联网搜索标准版), tier-1: 42 CNY per 1000 calls
+    "aliyun_iqs_search": {
+        "unit": "calls",
+        "price_per_1000_calls": 42.0,
+        "billing_calls_key": "effective_calls",
+        "note": "Default to lowest ladder tier (tier-1) for standard search.",
+    },
+    # Local/sandbox tools or third-party tools without this doc's billing scope.
+    "python_interpreter": {
+        "unit": "calls",
+        "price_per_1000_calls": 0.0,
+        "billing_calls_key": "calls",
+    },
+    "PythonInterpreter": {
+        "unit": "calls",
+        "price_per_1000_calls": 0.0,
+        "billing_calls_key": "calls",
+    },
+    "google_search": {
+        "unit": "calls",
+        "price_per_1000_calls": 0.0,
+        "billing_calls_key": "effective_calls",
+    },
+    "google_scholar": {
+        "unit": "calls",
+        "price_per_1000_calls": 0.0,
+        "billing_calls_key": "effective_calls",
+    },
+    "baidu_search": {
+        "unit": "calls",
+        "price_per_1000_calls": 36.0,
+        "billing_calls_key": "effective_calls",
+    },
+    "Visit": {
+        "unit": "calls",
+        "price_per_1000_calls": 0.0,
+        "billing_calls_key": "calls",
+    },
+}
+
+
 def get_model_pricing(model_name: str) -> dict:
     """Get pricing for a model. Returns None if not found."""
-    model_lower = model_name.lower()
+    model_lower = (model_name or "").strip().lower()
+
+    # Normalize provider prefixes, e.g. openai/gpt-4o -> gpt-4o
+    if "/" in model_lower:
+        model_lower = model_lower.split("/")[-1]
+
+    # Normalize endpoint-like names, e.g. xxx:model
+    if ":" in model_lower:
+        model_lower = model_lower.split(":")[-1]
+
+    # Alias remapping first
+    model_lower = MODEL_ALIASES.get(model_lower, model_lower)
     
     # Direct match
     if model_lower in MODEL_PRICING:
@@ -222,6 +287,45 @@ def calculate_cost(
     }
 
 
+def get_tool_pricing(tool_name: str) -> dict:
+    """Get pricing configuration for a tool. Returns None if not found."""
+    if not tool_name:
+        return None
+    return TOOL_PRICING.get(tool_name)
+
+
+def calculate_tool_cost(
+    tool_name: str,
+    calls: int = 0,
+    effective_calls: int = 0,
+) -> dict:
+    """Calculate tool cost using configured CNY pricing."""
+    pricing = get_tool_pricing(tool_name)
+    if pricing is None:
+        return {
+            "tool_name": tool_name,
+            "billed_calls": 0,
+            "unit_price_per_1000_calls": 0.0,
+            "total_cost": 0.0,
+            "estimated": True,
+            "warning": f"Tool pricing not found for {tool_name}",
+        }
+
+    billing_key = pricing.get("billing_calls_key", "calls")
+    billed_calls = max(0, int(effective_calls if billing_key == "effective_calls" else calls))
+    price_per_1000 = float(pricing.get("price_per_1000_calls", 0.0))
+    total_cost = billed_calls * (price_per_1000 / 1000.0)
+
+    return {
+        "tool_name": tool_name,
+        "billed_calls": billed_calls,
+        "unit_price_per_1000_calls": price_per_1000,
+        "total_cost": total_cost,
+        "estimated": False,
+        "note": pricing.get("note", ""),
+    }
+
+
 def format_cost_usd(cost: float) -> str:
     """Format cost in USD."""
     if cost < 0.0001:
@@ -234,4 +338,4 @@ def format_cost_usd(cost: float) -> str:
 
 def format_cost_cny(cost: float) -> str:
     """Format cost in CNY."""
-    return f"¥{cost * USD_TO_CNY:.4f}"
+    return f"¥{cost:.4f}"
