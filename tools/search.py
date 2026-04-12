@@ -10,10 +10,14 @@ import requests
 from typing import List, Union, Optional
 
 try:
-    from config import SEARCH_API_KEY, SEARCH_API_URL
+    from config import SEARCH_API_KEY, SEARCH_API_KEY_BACKUPS, SEARCH_API_URL
 except ImportError:
     import os
     SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
+    SEARCH_API_KEY_BACKUPS = [
+        os.getenv("SEARCH_API_KEY_BACKUP_1", ""),
+        os.getenv("SEARCH_API_KEY_BACKUP_2", ""),
+    ]
     SEARCH_API_URL = os.getenv("SEARCH_API_URL", "https://serpapi.com/search")
 
 
@@ -51,12 +55,22 @@ class Search:
         """
         self.api_key = api_key or SEARCH_API_KEY
         self.api_url = api_url or SEARCH_API_URL
+        self.api_key_backups = [k for k in SEARCH_API_KEY_BACKUPS if k]
+        self.key_index = 0
         
         # Statistics
         self.total_requests = 0
         self.successful_requests = 0
         self.failed_requests = 0
         self.total_latency_ms = 0.0
+    
+    def _switch_api_key(self):
+        """Switch to the next backup API key."""
+        if self.key_index < len(self.api_key_backups):
+            self.api_key = self.api_key_backups[self.key_index]
+            self.key_index += 1
+            return True
+        return False
     
     def get_stats(self) -> dict:
         """Get search statistics."""
@@ -118,6 +132,18 @@ class Search:
         for attempt in range(max_retries):
             try:
                 response = requests.get(self.api_url, params=params, timeout=30)
+                
+                # Handle 429 (rate limit) error with API key switch
+                if response.status_code == 429:
+                    if self._switch_api_key():
+                        params["api_key"] = self.api_key
+                        time.sleep(1)
+                        continue
+                    else:
+                        self.failed_requests += 1
+                        self.total_latency_ms += (time.time() - start_time) * 1000
+                        return f"Search failed for '{query}': Rate limit exceeded (429). No more backup API keys available."
+                
                 response.raise_for_status()
                 results = response.json()
                 

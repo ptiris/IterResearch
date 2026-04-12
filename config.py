@@ -32,6 +32,10 @@ SUMMARY_LLM_AUTH = os.getenv("SUMMARY_LLM_AUTH", "")
 # =============================================================================
 # Google Search API (via SerpAPI or similar service)
 SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
+SEARCH_API_KEY_BACKUPS = [
+    os.getenv("SEARCH_API_KEY_BACKUP_1", ""),
+    os.getenv("SEARCH_API_KEY_BACKUP_2", ""),
+]
 SEARCH_API_URL = os.getenv("SEARCH_API_URL", "https://serpapi.com/search")
 
 # Google Scholar API
