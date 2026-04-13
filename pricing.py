@@ -161,10 +161,8 @@ MODEL_PRICING = {
 }
 
 
-# Tool pricing in CNY, defaulting to the lowest ladder tier where applicable.
-# Source: Aliyun IQS billing docs (lowest tier / default tier assumptions).
+# Source: Aliyun IQS billing docs (lowest tier / default tier assumptions). 
 TOOL_PRICING = {
-    # UnifiedSearch Generic (联网搜索标准版), tier-1: 42 CNY per 1000 calls
     "aliyun_iqs_search": {
         "unit": "calls",
         "price_per_1000_calls": 42.0,
