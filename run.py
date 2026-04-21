@@ -1034,7 +1034,7 @@ def call_llm(
             payload = {
                 "model": model_name,
                 "messages": request_messages,
-                "temperature": 0.2,
+                "temperature":1.0 ,
                 "top_p": 0.80,
                 "presence_penalty": 1.5
             }
